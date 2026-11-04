@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+node_modules/
+recon.json
+*.log
+.DS_Store

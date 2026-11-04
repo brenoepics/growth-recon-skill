@@ -1,0 +1,43 @@
+{
+  "name": "growth-recon-skill",
+  "version": "1.0.0",
+  "description": "An AI agent skill that reads a website's public marketing and tracking setup and turns it into an analyst report.",
+  "bin": {
+    "growth-recon-skill": "bin/install.js"
+  },
+  "scripts": {
+    "postinstall": "node -e \"0\""
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agent-skill",
+    "skill",
+    "competitive-intelligence",
+    "google-tag-manager",
+    "gtm",
+    "martech",
+    "growth",
+    "osint"
+  ],
+  "author": "brenoepics",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brenoepics/growth-recon-skill.git"
+  },
+  "homepage": "https://github.com/brenoepics/growth-recon-skill#readme",
+  "bugs": {
+    "url": "https://github.com/brenoepics/growth-recon-skill/issues"
+  },
+  "engines": {
+    "node": ">=16.7.0"
+  },
+  "files": [
+    "bin",
+    "SKILL.md",
+    "references",
+    "scripts",
+    "examples"
+  ]
+}

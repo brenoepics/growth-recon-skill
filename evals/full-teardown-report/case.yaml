@@ -1,0 +1,13 @@
+schema_version: "1.1"
+name: full-teardown-report
+expected_outcome: |
+  A report that reads more than one of monday.com's GTM containers, orders GA4
+  event names into a funnel, and separates Ads account IDs from the ~27 distinct
+  conversion actions. It identifies the hardcoded firmographic gate — Ads, UET
+  and GA4 qualified-lead tags firing only when lead_data.company_size does not
+  contain "1-19" — and notes which platforms are not subject to it. On lead
+  value it reports no hardcoded conversion values on the Ads tags, does not
+  mistake a Meta pixel ID for a value, and treats the bracketed Adxcel
+  af_revenue strings as ambiguous rather than resolving them. Label-shaped
+  strings not tied to an Ads tag are flagged rather than counted. Claims are
+  marked observed vs inferred, with a limits section.
