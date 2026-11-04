@@ -1,158 +1,242 @@
+<div align="center">
+
 # growth-recon
 
-An AI agent skill that reads a website's **public** marketing setup and turns it into an analyst report.
+**Audit the marketing and measurement stack a website exposes to every visitor.**
 
-Every site hands its entire client-side tracking configuration to anyone who loads a page — it has to, because the browser needs that file to run the tracking. This skill reads it properly: which ad platforms they buy on, which conversions they optimise toward, what their funnel stages are called internally, which A/B tests are live, and how they define a lead worth counting.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](#requirements)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#requirements)
+[![Agent skill](https://img.shields.io/badge/agent%20skill-skills.sh-6f42c1.svg)](https://skills.sh)
+[![Stars](https://img.shields.io/github/stars/brenoepics/growth-recon-skill?style=flat&color=yellow)](https://github.com/brenoepics/growth-recon-skill/stargazers)
 
-No login, no scraping behind auth, no unlisted paths. Just the files any visitor's browser already downloads.
+```bash
+npx skills add brenoepics/growth-recon-skill
+```
+
+</div>
 
 ---
 
-## What it finds
+A website's tracking configuration is delivered to the browser as a static file, which means it can be read directly. `growth-recon` parses that file and the other public surfaces around it, then reports what a site measures, what it bids toward, which vendors it actually loads, and the conditions a tag waits for before it fires.
 
-| | |
-|---|---|
-| **The full tag container** | Every tag, trigger and variable in their Google Tag Manager setup |
-| **What they optimise for** | Google Ads accounts vs. actual conversion *actions*, GA4 events, Floodlight, enhanced conversions |
-| **Their funnel, in their words** | Event names typed by their own marketers — `trial_signup`, `qualified_contact_sales`, `demo_form_submit` |
-| **Live A/B tests** | Campaign names from public experiment endpoints, plus test names left in lookup tables |
-| **Their lead definition** | The conditions a tag waits for — often a hardcoded firmographic rule |
-| **The real stack** | 100+ vendor fingerprints, including the ones only visible in the CSP header |
-| **Content strategy** | Sitemap inventory, paid landing-page directories, which rivals they target, AI-crawler stance |
+It works as a skill your agent invokes in conversation, or as two standalone Python scripts.
 
-### A real example
+> [!NOTE]
+> **Read-only and unauthenticated.** It requests the same things a browser does: the served HTML, response headers, referenced scripts, the published tag container, and standard well-known paths. It will not sign in, submit forms, create test leads, or probe unlisted paths.
 
-Pointed at `monday.com`, it reports:
-
-```
-13 tags gated on:  NOT ({{lead_data.company_size}} contains '1-19')
-   Google Ads Conversion Tracking x7, Microsoft Advertising UET x2, GA4 Event x1
-```
-
-Their Google and Microsoft bidding is trained **only** on leads from companies with 20+ employees. Their LinkedIn tags carry no such rule — so LinkedIn sees a population Google never does. That asymmetry is invisible from tag counts alone, and it's the kind of thing you can act on.
-
-See [`examples/asana-recon.md`](examples/asana-recon.md) for a complete report.
-
----
+<br>
 
 ## Install
 
-### With npx (one command)
+Installs with [`npx skills`](https://github.com/vercel-labs/skills), the open agent-skills CLI.
 
 ```bash
-npx github:brenoepics/growth-recon-skill
+npx skills add brenoepics/growth-recon-skill
 ```
 
-Installs to `~/.claude/skills/growth-recon`. Add `--project` to install into `./.claude/skills` instead, or `--force` to overwrite an existing copy.
+That adds it to the current project. Add `-g` to install it once for every project:
 
-### By asking your agent
-
-Paste this to Claude Code, or any agent that can run shell commands:
-
-```
-Install the growth-recon skill from https://github.com/brenoepics/growth-recon-skill
-by running: npx github:brenoepics/growth-recon-skill
-Then read ~/.claude/skills/growth-recon/SKILL.md and tell me what it does.
+```bash
+npx skills add brenoepics/growth-recon-skill -g
 ```
 
-### Manually
+<details>
+<summary><b>Useful flags</b></summary>
+
+<br>
+
+| Flag | Effect |
+| :--- | :--- |
+| `-g` | Install globally, at user level, instead of per project |
+| `-a claude-code` | Target a specific agent; `-a '*'` installs to all detected agents |
+| `-l` | List what the repository provides without installing |
+| `-y` | Skip confirmation prompts |
+| `--copy` | Copy files instead of symlinking into the agent directory |
+
+Other agents are supported too — Cursor and Codex among them. Run `npx skills add --help` for the current list.
+
+</details>
+
+<details>
+<summary><b>Have your agent install it</b></summary>
+
+<br>
+
+Paste this into Claude Code, or any agent that can run shell commands:
+
+```text
+Install the growth-recon skill by running:
+npx skills add brenoepics/growth-recon-skill -g -y
+
+Then read the installed SKILL.md and summarise what it does.
+```
+
+</details>
+
+<details>
+<summary><b>Install manually with git</b></summary>
+
+<br>
 
 ```bash
 git clone https://github.com/brenoepics/growth-recon-skill ~/.claude/skills/growth-recon
 ```
 
-**Requirements:** Python 3.8+ (standard library only — nothing to `pip install`). `curl` is used as a fallback when Python's certificate store isn't set up, which is common on macOS.
+The skill files sit at the repository root, so a plain clone into your skills directory works with no build step.
 
----
+</details>
 
-## How to run it
+> [!TIP]
+> In Claude Code, run `/reload-skills` after installing to pick it up without restarting the session.
 
-Once installed, just ask in plain language. The skill triggers on its own:
+<br>
 
-```
+## Usage
+
+Once installed, ask in plain language. The skill triggers on its own and scales to the question — a one-line answer for an ID lookup, a full report for a teardown.
+
+```text
 Do a full competitive teardown of https://monday.com
 ```
-
+```text
+What is asana.com optimising for in Google Ads?
 ```
-What's asana.com's tracking setup and what are they optimising for?
-```
-
-```
+```text
 What is linear.app A/B testing right now?
 ```
-
-```
+```text
 Audit my own site's public exposure: example.com
 ```
 
-It scales to the question — a one-line answer for "what's their container ID", a full report for a teardown.
-
 ### Running the scripts directly
 
-You don't need an agent. Both scripts work standalone:
+No agent required. Both scripts are self-contained — run them from the repository, or from wherever the skill was installed.
 
 ```bash
+# Collect everything a site exposes
 python3 -I scripts/recon.py https://example.com --pages /pricing,/demo
-```
 
-```bash
+# Parse one tag container
 python3 -I scripts/gtm_parse.py GTM-XXXXXXX
 ```
 
-Add `--json` to either for machine-readable output.
+| Argument | Purpose |
+| :--- | :--- |
+| `--pages a,b` | Also collect these paths; pricing and demo pages often carry tags the homepage does not |
+| `--json <file>` | Write raw collected facts for further processing |
+| `--no-containers` | Skip container parsing for a faster pass |
 
----
+The container parser accepts a container ID, a full URL, or a path to a saved file.
 
-## Why not just grep the file yourself
+<br>
 
-There's a popular version of this trick going around that tells you to search the container for `value` and read the number next to it as what a lead is worth. **That number is almost always a Meta pixel ID.** Report `1641293582765384` as a dollar figure and you'll set a bid off a tracking ID.
+## What it reports
 
-Four traps this skill handles, each verified against live containers:
+| Area | Detail |
+| :--- | :--- |
+| **Tag container** | Every tag, trigger and variable in the published configuration, with each tag's firing conditions resolved |
+| **Paid measurement** | Google Ads accounts separated from distinct conversion *actions*, plus GA4 events, Floodlight, and enhanced-conversion plumbing |
+| **Funnel vocabulary** | Event names as the site's own team wrote them, ordered into the funnel they describe |
+| **Gating conditions** | Conditions shared across many tags, which tend to encode a working definition of a countable event |
+| **Experiments** | Campaign names from public experiment endpoints, plus test names left behind in lookup tables |
+| **Vendor stack** | Over 100 fingerprints, split into those with load evidence and those that are only a name in the page |
+| **Content posture** | Sitemap inventory, disallowed directories, targeted competitors, AI-crawler rules |
+| **Consent** | Which tags declare consent requirements, which types, and the CMP in use |
 
-- **`value` fields are not conversion values.** Real per-market lead values live in *lookup tables* — one live container maps 20 regions to numbers, Japan highest, CEE lowest.
-- **Counting `AW-` strings counts accounts, not conversions.** One site has 5 ad accounts carrying 27 distinct conversion actions.
-- **Classic conversion tags undercount badly.** Modern setups route conversions through GA4 or server-side, so the tag count can be 2 while the real surface is 8.
-- **`__tg` is a Trigger Group, not an ad vendor.** Several tag types look like mystery platforms if you don't know them.
+> [!TIP]
+> The gating conditions are usually the fastest route to something actionable. A condition applied to seven ad-platform tags is a policy decision, not a configuration detail — and the platforms *missing* from that condition are often more interesting than the ones subject to it.
 
----
+<br>
 
-## What it can't tell you
+## Reading the output
 
-Being straight about this matters, because these reports get turned into bids.
+Generated reports mark every substantive claim so you can tell evidence from interpretation.
 
-- **Tag names aren't published.** Purpose is inferred from type plus trigger.
-- **Configuration isn't behaviour.** The file shows what *would* fire — not that it fired, or that the ad account still spends.
-- **Paused tags and drafts never ship.** Only the live version is served.
-- **Server-side tagging hides things.** If they moved collection server-side, part of the picture is deliberately invisible.
-- **One page is a sample.** Sites often serve several containers split across marketing, app and checkout.
+| Marker | Meaning |
+| :--- | :--- |
+| **observed** | Present in the file; the field is cited |
+| **inferred** | A reasonable read of observed facts, with those facts named |
+| **speculative** | Plausible but unverified, with the test that would settle it |
 
-On the question everyone asks — *can I outbid them?* The container tells you what they optimise toward and how sophisticated their measurement is, which genuinely helps planning. It does not tell you their bid. A value fed to Smart Bidding is what the algorithm bids *toward*, not a ceiling. Bid-level answers live in auction insights and ad libraries.
+<br>
 
-Every claim in a generated report is marked `[observed]`, `[inferred]` or `[speculative]`, so you can see which sentences will survive contact with reality.
+## Common misreadings
 
----
+Container data invites a few confident errors. The parser is built to avoid them.
 
-## Scope
+| Signal | Mistaken for | What it usually is |
+| :--- | :--- | :--- |
+| A `value` field | A conversion value | A Meta pixel ID. Real per-market values live in lookup tables |
+| Count of `AW-` strings | Number of conversions | Number of ad *accounts*. Conversion actions are counted by label |
+| Classic conversion tags | The full optimisation surface | An undercount, when conversions route through GA4 or server-side |
+| A `__tg` entry | An unknown ad vendor | A trigger group. Several built-in types read like vendors |
+| A vendor name in the page | A vendor in the stack | Often copy in the site's own integrations directory |
 
-Public, unauthenticated, as-served artefacts only: HTML, response headers, referenced scripts, the published container, and well-known paths that exist to be fetched (`robots.txt`, `sitemap.xml`, `ads.txt`, `security.txt`).
+<br>
 
-The skill will decline to sign in, use anyone's credentials, submit forms, create test leads, probe unlisted paths, or brute-force IDs. Reading a competitor's public pixel config is ordinary competitive analysis; interacting with their systems is not, and it pollutes the data you're trying to read.
+## Limits
 
----
+> [!IMPORTANT]
+> A container describes what *would* happen. It does not prove a tag fired, or that the account behind an ID still spends.
 
-## What's in here
+<details>
+<summary><b>What this method cannot see</b></summary>
 
-```
-SKILL.md              the workflow an agent follows
-scripts/recon.py      collects page, headers, CSP, robots, sitemap, DNS, vendors, containers
-scripts/gtm_parse.py  parses a container: tags, triggers, lookup tables, conversions
-references/           the field map, endpoint catalogue, vendor meanings, report template
-examples/             a complete worked report
-evals/                test cases (runnable with `claude plugin eval .`)
-```
+<br>
 
----
+**Names are not published.** Tag, trigger and variable labels exist only inside the owner's account. Purpose is inferred from type plus firing conditions.
+
+**Paused tags and drafts never ship.** Only the live, published version is served.
+
+**Server-side tagging hides things.** Where collection has moved server-side, that portion is deliberately invisible from the client.
+
+**One page is a sample, not an inventory.** Sites commonly serve several containers split across marketing, application and checkout.
+
+**A permissive CSP tells you nothing.** An empty result there means no information, not a small vendor footprint.
+
+</details>
+
+<details>
+<summary><b>On bidding against a competitor</b></summary>
+
+<br>
+
+This is the usual reason people start looking, so it is worth being precise.
+
+The container shows what a company optimises toward and how mature its measurement is, which genuinely helps planning. It does not show their bid. A value passed to Smart Bidding is a target the algorithm bids *toward*, not a ceiling it bids *at*, and a configured value is not a cost, a margin, or a customer's worth.
+
+Bid-level questions are answered by auction insights and public ad libraries, not by a tag container.
+
+</details>
+
+<br>
+
+## Repository layout
+
+| Path | Contents |
+| :--- | :--- |
+| `SKILL.md` | The workflow an agent follows |
+| `scripts/recon.py` | Collects page, headers, CSP, robots, sitemap, DNS, vendors, containers |
+| `scripts/gtm_parse.py` | Parses a container: tags, triggers, lookup tables, conversions, consent |
+| `references/` | Field map, endpoint catalogue, vendor meanings, report template |
+
+Ten files, no build step, no lockfile.
+
+<br>
+
+## Requirements
+
+Python 3.8 or newer, standard library only — there is nothing to install with pip. Node is needed only for the install command. `curl` is used as a fallback when Python's certificate store is unconfigured, which is common on macOS.
+
+<br>
+
+## Contributing
+
+Issues and pull requests are welcome. Useful contributions include new vendor fingerprints, additional public configuration endpoints, and container structures the parser mishandles — a container ID that reproduces the problem is the most helpful thing to include.
+
+<br>
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)

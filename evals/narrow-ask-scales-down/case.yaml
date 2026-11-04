@@ -1,8 +1,0 @@
-schema_version: "1.1"
-name: narrow-ask-scales-down
-expected_outcome: |
-  A short answer naming GTM-5K82J2 and VWO, and reporting the live VWO campaign
-  names from the public settings endpoint rather than only the vendor. Any
-  Google Optimize OPT- IDs found are called out as dead legacy tags, since
-  Optimize was sunset in September 2023. No full teardown report, because the
-  user asked for a quick answer.

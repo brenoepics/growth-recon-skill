@@ -180,10 +180,6 @@ Follow `references/report-template.md`. Lead with what someone can act on,
 not with an inventory of IDs. A reader should be able to skip to "So what" and
 get the three things worth doing.
 
-`examples/asana-recon.md` is a complete worked report from a real target. It is
-the fastest way to calibrate depth, tone and how the confidence markers read in
-practice — skim it before writing your first report.
-
 Mark every substantive claim:
 
 - **Observed** — it is in the file; quote or cite the field.
