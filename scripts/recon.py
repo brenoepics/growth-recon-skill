@@ -338,6 +338,120 @@ def third_party_hosts(html, own_host):
     return [{"host": h, "refs": n} for h, n in sorted(hosts.items(), key=lambda x: -x[1])]
 
 
+def advertiser_identity(html, host, containers):
+    """Work out who this company is *as an advertiser*, so their public ad
+    libraries can be opened.
+
+    The ad libraries are the only public source that shows what a competitor is
+    actually running right now — the creative, the headline, the call to action
+    and the date it started. A tag container shows the plumbing; the ad library
+    shows the campaign. They answer different questions and the second one is
+    usually the one people came for.
+
+    Scoping matters: a keyword search on a brand name returns other advertisers'
+    ads that merely mention it. Google's centre scopes by domain, which is exact.
+    Meta scopes properly only by numeric Page ID, which many sites publish in an
+    `fb:pages` meta tag.
+    """
+    base = host.lower().replace("www.", "")
+    # Take the registrable label, not the first one: "news.ycombinator.com" is
+    # ycombinator, not news. Two-part public suffixes get one extra hop back.
+    labels = [l for l in base.split(".") if l]
+    two_part = {"co", "com", "org", "net", "gov", "edu", "ac"}
+    if len(labels) >= 3 and labels[-2] in two_part:
+        brand = labels[-3]
+    elif len(labels) >= 2:
+        brand = labels[-2]
+    else:
+        brand = labels[0] if labels else base
+
+    ident = {"domain": base, "brand": brand, "facebook_page_ids": [], "facebook_slugs": []}
+
+    # fb:pages is the exact numeric Page ID, when a site publishes it.
+    for m in re.finditer(r'<meta[^>]+property=["\']fb:pages["\'][^>]+content=["\']([^"\']+)', html, re.I):
+        ident["facebook_page_ids"] += [x.strip() for x in m.group(1).split(",") if x.strip().isdigit()]
+
+    # Otherwise the social link gives a slug, which a human can resolve in one click.
+    for m in re.finditer(r'facebook\.com/([A-Za-z0-9._%-]{2,50})', html, re.I):
+        slug = m.group(1)
+        if slug.lower() not in ("sharer", "dialog", "plugins", "tr", "groups", "profile.php",
+                                "pages", "events", "watch", "login", "help"):
+            ident["facebook_slugs"].append(slug)
+    ident["facebook_slugs"] = sorted(set(ident["facebook_slugs"]))[:5]
+    ident["facebook_page_ids"] = sorted(set(ident["facebook_page_ids"]))[:5]
+
+    # Ad account IDs already recovered from the containers.
+    aw, meta_pixels = set(), set()
+    for c in containers.values():
+        if not isinstance(c, dict):
+            continue
+        aw |= set((c.get("google_ads_summary") or {}).get("ads_accounts") or [])
+        meta_pixels |= set((c.get("vendor_account_ids") or {}).get("meta_pixel") or [])
+    ident["google_ads_accounts"] = sorted(aw)
+    ident["meta_pixel_ids"] = sorted(meta_pixels)
+    return ident
+
+
+def ad_library_links(ident):
+    """Build ready-to-open ad library URLs.
+
+    `status` is honest about what each one costs: "open" works unauthenticated,
+    "sign-in" will hit a login wall, "manual" needs one human step to scope it.
+    """
+    q = urllib.parse.quote_plus
+    base, brand = ident["domain"], ident["brand"]
+    out = {}
+
+    out["google_ads_transparency"] = {
+        "url": f"https://adstransparency.google.com/?region=anywhere&domain={q(base)}",
+        "status": "open",
+        "shows": "every verified advertiser account running ads to this domain, with creatives, "
+                 "formats, platforms and date ranges",
+    }
+
+    if ident["facebook_page_ids"]:
+        pid = ident["facebook_page_ids"][0]
+        out["meta_ad_library"] = {
+            "url": ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+                    f"&country=ALL&media_type=all&view_all_page_id={pid}"),
+            "status": "open",
+            "shows": "their active ads only, with creative, primary text, call to action, "
+                     "start date and Library ID",
+            "scoped_by": f"facebook page id {pid} (from the fb:pages meta tag)",
+        }
+    else:
+        out["meta_ad_library"] = {
+            "url": ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+                    f"&country=ALL&media_type=all&q={q(brand)}"),
+            "status": "manual",
+            "shows": "a keyword search, which also returns unrelated advertisers",
+            "scoped_by": "nothing yet — no fb:pages meta tag was published",
+            "next_step": ("open it, type the brand into the advertiser box and pick their Page; "
+                          "the URL then carries view_all_page_id, which scopes it exactly"
+                          + (f". Their page slug looks like '{ident['facebook_slugs'][0]}'"
+                             if ident["facebook_slugs"] else "")),
+        }
+
+    out["meta_eu_transparency"] = {
+        "url": "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=DE"
+               + (f"&view_all_page_id={ident['facebook_page_ids'][0]}" if ident["facebook_page_ids"] else ""),
+        "status": "open" if ident["facebook_page_ids"] else "manual",
+        "shows": "EU ads carry extra disclosure: reach, and the targeting parameters used",
+    }
+
+    out["tiktok_ads"] = {
+        "url": f"https://library.tiktok.com/ads?region=all&adv_name={q(brand)}",
+        "status": "open",
+        "shows": "TikTok's commercial content library, where the advertiser operates in covered regions",
+    }
+    out["linkedin_ads"] = {
+        "url": f"https://www.linkedin.com/company/{q(brand)}/posts/?feedView=ads",
+        "status": "sign-in",
+        "shows": "their sponsored posts; LinkedIn shows an auth wall to signed-out visitors",
+    }
+    return out
+
+
 def parse_robots(body):
     """Group robots.txt directives by user-agent and compare AI crawlers to `*`.
 
@@ -745,6 +859,10 @@ def collect(target, extra_pages=(), do_containers=True):
         "A vendor seen only in 'csp' or 'gtm-container' is still live -- it is "
         "loaded at runtime rather than written into the served HTML.")
 
+    # --- who they are as an advertiser, and where to watch their ads ------
+    report["advertiser"] = advertiser_identity(html, host, report["gtm_containers"])
+    report["ad_libraries"] = ad_library_links(report["advertiser"])
+
     # --- VWO settings file (live test names) ------------------------------
     # Runs last, because VWO is usually detected from the container rather than
     # the HTML, so the fingerprint set has to be widened first.
@@ -847,6 +965,26 @@ def render(r):
         a("\n## gtag/js")
         for gid, v in r["gtag"].items():
             a(f"  {gid}: linked -> {', '.join(v.get('linked_ids', [])) or v.get('error', 'none')}")
+
+    adv = r.get("advertiser") or {}
+    if r.get("ad_libraries"):
+        a("\n## Live ads - open these to see what they are running right now")
+        if adv.get("google_ads_accounts"):
+            a(f"  google ads accounts in their container: {', '.join(adv['google_ads_accounts'])}")
+        if adv.get("facebook_page_ids"):
+            a(f"  facebook page id: {', '.join(adv['facebook_page_ids'])}")
+        elif adv.get("facebook_slugs"):
+            a(f"  facebook page slug: {', '.join(adv['facebook_slugs'][:3])}  (no numeric id published)")
+        if adv.get("meta_pixel_ids"):
+            a(f"  meta pixel ids: {', '.join(adv['meta_pixel_ids'][:4])}")
+        a("")
+        for name, v in r["ad_libraries"].items():
+            flag = {"open": "OPEN     ", "manual": "1 STEP   ", "sign-in": "SIGN-IN  "}.get(v["status"], "         ")
+            a(f"  {flag}{name}")
+            a(f"      {v['url']}")
+            a(f"      {v['shows']}")
+            if v.get("next_step"):
+                a(f"      next: {v['next_step']}")
 
     if r["experimentation"]:
         a("\n## Experimentation datafiles (public)")

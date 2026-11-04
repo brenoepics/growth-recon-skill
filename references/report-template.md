@@ -21,9 +21,27 @@ name the facts it rests on. Where it's speculative, say what would confirm it.
 # Growth recon: <company> (<url>)
 Collected <date> · <n> GTM containers · <n> vendors · evidence: public files only
 
+## In plain English
+
+Four to six short sentences for someone who does not work in analytics. No tool
+names, no IDs, no acronyms — if a term needs explaining, it does not belong in
+this section. Cover, in order:
+
+- what this company sells and who to
+- how they get customers, in ordinary words ("they pay for search ads and push
+  people into a free trial")
+- the one thing they measure most carefully
+- the one surprising or exploitable thing you found
+- what someone competing with them should do about it
+
+Write it so a founder, a salesperson or a client can read only this section and
+come away with something they can act on. Everything below is the evidence for
+it.
+
 ## Bottom line
-Three to five sentences. What kind of go-to-market machine is this, how mature
-is their measurement, and where are they most exposed. No ID lists here.
+Three to five sentences, now allowed to be technical. What kind of go-to-market
+machine is this, how mature is their measurement, and where are they most
+exposed. No ID lists here.
 
 ## So what — the three things worth acting on
 1. **<Action>** — why, from which evidence, and the caveat that limits it.
@@ -57,6 +75,35 @@ Only what the files actually support.
   which is not their CAC, their bid, or their margin
 - If no literals: say that values are passed at runtime, that the container
   shows the schema rather than the numbers, and what that still tells you
+
+## Live ads
+
+What they are running right now, from the public ad libraries. Lead with the
+creative — it is the part a reader actually wants to see.
+
+### <Platform> — <n> active ads
+
+![<short description of the creative>](<screenshot path or image url>)
+
+| Headline / primary text | Call to action | Destination | Running since | Library ID |
+|---|---|---|---|---|
+
+Then two or three sentences of reading, which is the part a screenshot cannot
+give you:
+
+- which products or segments get their own creative, and which get none
+- which messages repeat or have run for months — longevity is their own verdict
+  on what works
+- how many locales are running, and whether any market gets noticeably more
+- whether the ad copy promises something their funnel events do not measure
+
+State the total count, not just the ads you quoted. "Six active ads" and "around
+five thousand" describe different companies, and a reader cannot tell which from
+a table of four examples.
+
+If a platform could not be scoped to this advertiser, say so plainly rather than
+reporting a keyword search as if it were theirs — a search for a brand name also
+returns competitors bidding against it.
 
 ## Experiments and personalisation
 Platform, and live test names where the container or endpoints expose them.
@@ -103,9 +150,21 @@ can re-run it.
 
 ## Notes on specific sections
 
-**Bottom line** is the hardest part and worth the effort. Write it last. If you
+**In plain English** is the section most readers will actually read, and the one
+most likely to be skipped when writing. Write it last, after the evidence is
+settled, and then strip every term of art out of it. A good test: if someone who
+has never opened a tag manager could not repeat your point back, rewrite it. It
+is not a summary of the report — it is the answer to "so what" for someone who
+will never read the rest.
+
+**Bottom line** is the technical counterpart and worth the same effort. If you
 cannot say what kind of machine this is in three sentences, you have collected
 without reading.
+
+**Live ads** is where a report stops being abstract. A reader who skims
+everything else will look at the creatives, so include at least one image and
+caption it. Keep the quoted ad copy short and attributed — it is someone else's
+marketing, reproduced for analysis, not yours to present as findings.
 
 **The funnel table** is what people actually come for, and it is the section
 most likely to be wrong in an interesting way: event names drift from reality,

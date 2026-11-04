@@ -20,6 +20,8 @@ npx skills add brenoepics/growth-recon-skill
 
 A website's tracking configuration is delivered to the browser as a static file, which means it can be read directly. `growth-recon` parses that file and the other public surfaces around it, then reports what a site measures, what it bids toward, which vendors it actually loads, and the conditions a tag waits for before it fires.
 
+It also points you at the ad libraries, where the campaigns that tracking was built to measure are on public display.
+
 It works as a skill your agent invokes in conversation, or as two standalone Python scripts.
 
 > [!NOTE]
@@ -131,6 +133,29 @@ The container parser accepts a container ID, a full URL, or a path to a saved fi
 
 <br>
 
+## Live ads
+
+Tag containers show the machinery. Ad libraries show the campaign — the creative, the headline, the call to action and the date it started.
+
+The collector works out who the site is *as an advertiser* and prints ready-to-open links, each labelled with what it costs you.
+
+| Library | Scoped by | Signed-out |
+| :--- | :--- | :--- |
+| Google Ads Transparency Center | Domain — exact, nothing to disambiguate | Yes |
+| Meta Ad Library | Numeric Page ID, read from the site's `fb:pages` tag | Yes |
+| Meta EU disclosure | Same, with an EU country — adds reach and targeting | Yes |
+| TikTok commercial content | Advertiser name, where the region is covered | Yes |
+| LinkedIn sponsored posts | Company slug | No — auth wall |
+
+Google names every verified advertiser account running ads to the domain, which you can reconcile against the account IDs found in the container. More accounts there than in the container usually means agency-run or regional campaigns the main site never loads.
+
+> [!WARNING]
+> Meta only scopes correctly by **numeric Page ID**. A keyword search on a brand name also returns other advertisers who merely mention it — on a live run, searching one B2B brand returned a grocery delivery service and a health newsletter as the top two results. The collector builds the exact URL when the site publishes an `fb:pages` tag, and tells you to narrow it by hand when it does not.
+
+Ad libraries do not publish spend, bids, targeting outside the EU disclosure, or performance. An ad that has run for months is a reasonable signal that it works, but that is inference, not a reported number.
+
+<br>
+
 ## What it reports
 
 | Area | Detail |
@@ -141,6 +166,7 @@ The container parser accepts a container ID, a full URL, or a path to a saved fi
 | **Gating conditions** | Conditions shared across many tags, which tend to encode a working definition of a countable event |
 | **Experiments** | Campaign names from public experiment endpoints, plus test names left behind in lookup tables |
 | **Vendor stack** | Over 100 fingerprints, split into those with load evidence and those that are only a name in the page |
+| **Live ads** | Advertiser identity resolved, with scoped links to each public ad library |
 | **Content posture** | Sitemap inventory, disallowed directories, targeted competitors, AI-crawler rules |
 | **Consent** | Which tags declare consent requirements, which types, and the CMP in use |
 
@@ -151,7 +177,9 @@ The container parser accepts a container ID, a full URL, or a path to a saved fi
 
 ## Reading the output
 
-Generated reports mark every substantive claim so you can tell evidence from interpretation.
+Reports open with a plain-English section — four to six sentences with no tool names, IDs or acronyms, covering what the company sells, how it gets customers, what it measures most carefully, and what a competitor should do about it. The technical detail follows underneath for anyone who wants it.
+
+After that, every substantive claim is marked so you can tell evidence from interpretation.
 
 | Marker | Meaning |
 | :--- | :--- |
