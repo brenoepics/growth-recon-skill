@@ -5,9 +5,6 @@
   "bin": {
     "growth-recon-skill": "bin/install.js"
   },
-  "scripts": {
-    "postinstall": "node -e \"0\""
-  },
   "keywords": [
     "claude",
     "claude-code",
