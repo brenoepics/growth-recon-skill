@@ -4,3 +4,11 @@ node_modules/
 recon.json
 *.log
 .DS_Store
+
+# Coverage artefacts. These matter more than usual here: the skills CLI copies
+# the whole repository into the user's skill directory, so anything committed
+# ships to everyone who installs it.
+*.cover
+.coverage
+htmlcov/
+trace.dat
