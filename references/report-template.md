@@ -8,7 +8,38 @@ plain markdown and let the renderer handle presentation. Two things it keys off:
 the `# ` title line (the template's "Growth recon: Acme (https://acme.com)" form
 becomes the cover) and the confidence markers, which become coloured chips.
 
-Two rules that do most of the work:
+## Write so anyone can read it
+
+This is the rule that matters most, and the easiest one to let slip. Reports
+like this get read by founders, salespeople and clients. Most of them do not
+work in analytics. If they have to re-read a sentence, the report has failed,
+however good the research behind it was.
+
+**Keep sentences short.** One idea each. Aim under 25 words. If a sentence has
+three clauses, it is three sentences.
+
+**Do not use em dashes.** They let you bolt a second thought onto a sentence
+that was already finished. Use a full stop and start again. A comma is fine for
+a short aside. The renderer counts them and will tell you how many you used.
+
+**Use the shorter word.** Say "use" not "utilise", "also" not "furthermore",
+"so" not "consequently", "about" not "approximately", "shows" not "demonstrates",
+"method" not "methodology", "many" not "numerous", "enough" not "sufficient".
+
+**Explain a term the first time, or drop it.** Words like container, pixel,
+conversion action and dataLayer mean nothing outside this field. Either give a
+five-word gloss ("their tag container, the file that runs their tracking") or
+find a plainer way to say it. Never use two pieces of jargon in one sentence.
+
+**Say the thing, then the evidence.** "They only count leads from companies with
+20 or more staff" lands. "The conversion is gated on a firmographic predicate"
+does not, and it says the same thing.
+
+Run the renderer when you are done. It reports em dashes, sentences over 34
+words, and long words with shorter swaps. Those counts are not style policing.
+They are the difference between a report someone reads and one they skim.
+
+Two more rules that do most of the work:
 
 **Lead with the read, not the inventory.** The reader can scroll to the ID
 tables. What they can't produce themselves is the judgment. If someone reads
@@ -29,11 +60,11 @@ Collected <date> · <n> GTM containers · <n> vendors · evidence: public files 
 ## In plain English
 
 Four to six short sentences for someone who does not work in analytics. No tool
-names, no IDs, no acronyms — if a term needs explaining, it does not belong in
+names, no IDs, no acronyms. If a term needs explaining, it does not belong in
 this section. Cover, in order:
 
 - what this company sells and who to
-- how they get customers, in ordinary words ("they pay for search ads and push
+- how they get customers, in ordinary words ("they pay for search ads, then push
   people into a free trial")
 - the one thing they measure most carefully
 - the one surprising or exploitable thing you found

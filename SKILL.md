@@ -292,6 +292,14 @@ them through conversion labels to reach the point has failed them. Write it last
 and strip the jargon out deliberately — it is easy to skip and it is the section
 that does the most work.
 
+**Write it so anyone can read it.** Short sentences, one idea each, under 25
+words where you can. No em dashes: they bolt a second thought onto a finished
+sentence, so use a full stop instead. Pick the shorter word every time. Explain
+a term the first time or drop it, and never put two pieces of jargon in one
+sentence. `references/report-template.md` has the full rule and the word swaps.
+The renderer counts em dashes, over-long sentences and long words, so run it and
+fix what it flags.
+
 **Deliver a PDF, not a markdown file.** Markdown is the working format; it is
 not what someone opens in a meeting or forwards to a client. Write the report as
 markdown, then render it:

@@ -54,6 +54,66 @@ BROWSER_NAMES = ["google-chrome", "google-chrome-stable", "chromium",
                  "brave-browser", "chrome"]
 
 
+# ---------------------------------------------------------------------------
+# Plain-language check
+#
+# A recon report is read by people who do not work in analytics, and the habits
+# that creep into this kind of writing -- em dashes stacking clauses onto one
+# sentence, and words like "optimisation surface" -- are exactly what loses
+# them. The renderer cannot rewrite the prose, but it can say where the reading
+# gets hard, which is enough to send someone back to fix it.
+# ---------------------------------------------------------------------------
+HARD_WORDS = {
+    "utilise": "use", "utilize": "use", "leverage": "use", "leveraging": "using",
+    "facilitate": "help", "methodology": "method", "subsequently": "later",
+    "aforementioned": "that", "commence": "start", "terminate": "end",
+    "endeavour": "try", "endeavor": "try", "ascertain": "find out",
+    "demonstrates": "shows", "indicates": "shows", "additionally": "also",
+    "furthermore": "also", "moreover": "also", "consequently": "so",
+    "nevertheless": "but", "notwithstanding": "despite", "approximately": "about",
+    "numerous": "many", "sufficient": "enough", "requisite": "needed",
+    "operationalise": "put to work", "granular": "detailed", "holistic": "whole",
+    "synergy": "fit", "paradigm": "model", "robust": "strong",
+}
+
+
+def style_check(md):
+    """Report where the writing is harder than it needs to be."""
+    prose = re.sub(r"```.*?```", "", md, flags=re.S)       # skip code blocks
+    prose = re.sub(r"`[^`]*`", "", prose)                  # and inline code
+    prose = re.sub(r"\|.*\|", "", prose)                   # and table rows
+    prose = re.sub(r"^\s*#.*$", "", prose, flags=re.M)      # and headings
+
+    notes = []
+
+    dashes = len(re.findall(r"\s[—–]\s", prose))
+    if dashes:
+        notes.append(f"{dashes} em dash{'es' if dashes != 1 else ''}. "
+                     "Most become a full stop and a new sentence.")
+
+    long_sents = []
+    for sent in re.split(r"(?<=[.!?])\s+", prose):
+        words = len(sent.split())
+        if words > 34:
+            long_sents.append((words, " ".join(sent.split()[:9])))
+    if long_sents:
+        notes.append(f"{len(long_sents)} sentence{'s' if len(long_sents) != 1 else ''} "
+                     f"over 34 words. Longest {max(w for w, _ in long_sents)}: "
+                     f'"{max(long_sents)[1]}..."')
+
+    found = {}
+    low = prose.lower()
+    for word, simpler in HARD_WORDS.items():
+        n = len(re.findall(r"\b" + word + r"\b", low))
+        if n:
+            found[word] = (n, simpler)
+    if found:
+        top = sorted(found.items(), key=lambda kv: -kv[1][0])[:5]
+        notes.append("long words: " + ", ".join(f"{w} -> {s}" for w, (n, s) in top))
+
+    return notes
+
+
 def find_browser():
     env = os.environ.get("CHROME_BIN") or os.environ.get("BROWSER_BIN")
     if env and os.path.isfile(env) and os.access(env, os.X_OK):
@@ -334,107 +394,146 @@ def render_markdown(md, base_dir):
 # ---------------------------------------------------------------------------
 CSS = """
 :root {
-  --ink: #15171c; --muted: #5b6472; --rule: #e3e7ed;
-  --accent: #2f5bd0; --accent-soft: #eef3ff;
-  --obs: #1c7a4a; --obs-bg: #e7f5ed;
-  --inf: #8a5a00; --inf-bg: #fdf1dc;
-  --spec: #5b6472; --spec-bg: #eef0f4;
+  --ink: #14161a; --body: #2b3038; --muted: #697180; --rule: #e4e8ee;
+  --accent: #2b5ce6; --accent-ink: #1b3fa8; --wash: #f4f7fd;
+  --obs: #11704a; --obs-bg: #e3f3ea;
+  --inf: #8a5300; --inf-bg: #fdf0da;
+  --spec: #5b6472; --spec-bg: #eceff4;
 }
-@page { size: A4; margin: 17mm 15mm 19mm 15mm; }
-@page { @bottom-right { content: counter(page); } }
+
+/* Running header and footer. Chrome does render paged-media margin boxes, so
+   the page furniture is real rather than drawn into the flow. The cover uses a
+   named page so it stays clean. */
+@page {
+  size: A4; margin: 20mm 16mm 18mm 16mm;
+  @top-left  { content: string(doctitle); font-family: Helvetica, Arial, sans-serif;
+               font-size: 7.5pt; letter-spacing: .07em; text-transform: uppercase;
+               color: #9aa3b2; }
+  @bottom-right { content: counter(page); font-family: Helvetica, Arial, sans-serif;
+                  font-size: 8.5pt; color: #9aa3b2; }
+}
+@page cover { margin: 0; @top-left { content: ""; } @bottom-right { content: ""; } }
+
 * { box-sizing: border-box; }
 html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-body {
-  font: 10.5pt/1.55 "Helvetica Neue", Helvetica, Arial, sans-serif;
-  color: var(--ink); margin: 0;
-}
+/* An explicit white background matters for the HTML fallback: without it a
+   viewer in dark mode paints the page black behind the text. */
+html, body { background: #fff; }
+body { font: 10.5pt/1.6 "Helvetica Neue", Helvetica, Arial, sans-serif;
+       color: var(--body); margin: 0; }
+h1 { string-set: doctitle content(); }
 
-/* Cover: one full page, content set a third of the way down, footnote pinned. */
-.cover { height: 247mm; display: flex; flex-direction: column; page-break-after: always; }
-.cover .top { flex: 0 0 auto; padding-top: 52mm; }
-.cover .eyebrow { font-size: 8.5pt; letter-spacing: .18em; text-transform: uppercase;
-                  color: var(--accent); font-weight: 700; margin-bottom: 5mm; }
-.cover .rule { height: 3px; width: 42mm; background: var(--accent); margin-bottom: 8mm; }
-.cover h1 { font-size: 34pt; line-height: 1.08; margin: 0 0 3mm; letter-spacing: -.022em;
-            max-width: 150mm; }
-.cover h1.long { font-size: 25pt; }
-.cover .domain { font-size: 13pt; color: var(--accent); margin: 0 0 11mm; font-weight: 500; }
-.cover .sub { font-size: 10.5pt; color: var(--muted); margin: 0; max-width: 128mm;
-              line-height: 1.5; }
-.cover .meta { margin-top: 7mm; font-size: 9.5pt; color: var(--muted); }
+/* ---------- Cover ---------- */
+.cover { page: cover; height: 297mm; width: 100%; page-break-after: always;
+         display: flex; flex-direction: column; position: relative;
+         padding: 0 22mm; }
+.cover::before { content: ""; position: absolute; top: 0; left: 0; right: 0;
+                 height: 11mm; background: var(--accent); }
+.cover::after { content: ""; position: absolute; left: 22mm; top: 11mm;
+                width: 34mm; height: 34mm; background: var(--wash);
+                border-bottom-right-radius: 34mm; }
+.cover .top { position: relative; z-index: 1; padding-top: 64mm; }
+.cover .eyebrow { font-size: 8pt; letter-spacing: .2em; text-transform: uppercase;
+                  color: var(--accent); font-weight: 700; margin-bottom: 6mm; }
+.cover h1 { font-size: 40pt; line-height: 1.04; margin: 0 0 4mm; color: var(--ink);
+            letter-spacing: -.03em; max-width: 140mm; font-weight: 700; }
+.cover h1.long { font-size: 27pt; }
+.cover .domain { font-size: 13pt; color: var(--accent); margin: 0 0 12mm;
+                 font-weight: 500; letter-spacing: -.01em; }
+.cover .sub { font-size: 10.5pt; color: var(--muted); margin: 0; max-width: 120mm; }
+.cover .meta { margin-top: 8mm; font-size: 9.5pt; color: var(--muted); }
 .cover .meta b { color: var(--ink); font-weight: 600; }
-.cover .note { margin-top: auto; font-size: 8pt; line-height: 1.45; color: var(--muted);
-               border-top: 1px solid var(--rule); padding-top: 4mm; max-width: 150mm; }
-.chip-note { font-size: 7.6pt; color: var(--muted); margin-left: 1.2mm; font-style: italic; }
+.cover .note { margin-top: auto; margin-bottom: 20mm; font-size: 8pt; line-height: 1.5;
+               color: var(--muted); border-top: 1px solid var(--rule);
+               padding-top: 4mm; max-width: 150mm; }
 
-/* Headings */
-h1, h2, h3, h4 { page-break-after: avoid; break-after: avoid; letter-spacing: -.01em; }
-h1 { font-size: 19pt; margin: 0 0 5mm; }
-h2 { font-size: 14pt; margin: 9mm 0 3.5mm; padding-bottom: 2mm;
-     border-bottom: 2px solid var(--rule); }
+/* ---------- Contents ---------- */
+.toc { page-break-after: always; padding-top: 2mm; }
+.toc h2 { font-size: 10pt; letter-spacing: .14em; text-transform: uppercase;
+          color: var(--muted); border: 0; padding: 0; margin: 0 0 6mm; font-weight: 700; }
+.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: toc; }
+.toc li { counter-increment: toc; padding: 2.6mm 0; border-bottom: 1px solid var(--rule);
+          font-size: 11pt; color: var(--ink); display: flex; gap: 5mm; }
+.toc li::before { content: counter(toc, decimal-leading-zero); color: var(--accent);
+                  font-weight: 700; font-size: 9pt; padding-top: .8mm; }
+
+/* ---------- Headings ---------- */
+h1, h2, h3, h4 { page-break-after: avoid; break-after: avoid; color: var(--ink); }
+h1 { font-size: 18pt; margin: 0 0 5mm; letter-spacing: -.02em; }
+h2 { font-size: 15pt; margin: 10mm 0 4mm; letter-spacing: -.015em; font-weight: 700;
+     padding-bottom: 2.5mm; border-bottom: 2px solid var(--accent); }
 h2:first-of-type { margin-top: 0; }
-h3 { font-size: 11.5pt; margin: 6mm 0 2mm; color: #262b33; }
+h3 { font-size: 11.5pt; margin: 7mm 0 2mm; font-weight: 650; }
 h4 { font-size: 10.5pt; margin: 4mm 0 1.5mm; color: var(--muted); }
-p { margin: 0 0 3mm; orphans: 3; widows: 3; }
-a { color: var(--accent); text-decoration: none; word-break: break-word; }
-hr { border: 0; border-top: 1px solid var(--rule); margin: 6mm 0; }
-strong { font-weight: 650; }
+p { margin: 0 0 3.2mm; orphans: 3; widows: 3; }
+a { color: var(--accent-ink); text-decoration: none; word-break: break-word; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 7mm 0; }
+strong { font-weight: 650; color: var(--ink); }
 
-/* Tables */
-.table-wrap { page-break-inside: auto; margin: 0 0 4mm; }
+/* ---------- The plain-English opener, set apart as the thing to read first --- */
+.plain-panel { background: var(--wash); border-radius: 4mm; padding: 7mm 8mm 5mm;
+               margin: 0 0 8mm; page-break-inside: avoid; }
+.plain-panel h2 { border: 0; padding: 0; margin: 0 0 4mm; font-size: 9pt;
+                  letter-spacing: .16em; text-transform: uppercase; color: var(--accent); }
+.plain-panel p { font-size: 12pt; line-height: 1.62; color: var(--ink); }
+.plain-panel p:last-child, .plain-panel ul:last-child { margin-bottom: 0; }
+
+/* ---------- Tables ---------- */
+.table-wrap { margin: 0 0 5mm; }
 table { border-collapse: collapse; width: 100%; font-size: 9.5pt; }
 thead { display: table-header-group; }
 tr { page-break-inside: avoid; break-inside: avoid; }
-th { background: #f5f7fa; font-weight: 650; text-align: left;
-     border-bottom: 2px solid var(--rule); padding: 2.2mm 2.6mm; }
-td { border-bottom: 1px solid var(--rule); padding: 2.2mm 2.6mm; vertical-align: top; }
-tbody tr:nth-child(even) td { background: #fafbfc; }
+th { background: var(--ink); color: #fff; font-weight: 600; text-align: left;
+     padding: 2.4mm 2.8mm; font-size: 8.6pt; letter-spacing: .04em;
+     text-transform: uppercase; }
+th:first-child { border-top-left-radius: 1.6mm; }
+th:last-child { border-top-right-radius: 1.6mm; }
+td { border-bottom: 1px solid var(--rule); padding: 2.4mm 2.8mm; vertical-align: top; }
+tbody tr:nth-child(even) td { background: #fafbfd; }
+tbody tr:last-child td { border-bottom: 1px solid var(--rule); }
 
-/* Lists */
-ul, ol { margin: 0 0 3mm; padding-left: 5.5mm; }
-li { margin-bottom: 1.4mm; }
-li > ul, li > ol { margin-top: 1.4mm; }
+/* ---------- Lists ---------- */
+ul, ol { margin: 0 0 3.2mm; padding-left: 5.5mm; }
+li { margin-bottom: 1.6mm; }
+li::marker { color: var(--accent); }
+li > ul, li > ol { margin-top: 1.6mm; }
 
-/* Code */
-code { font: 9pt/1.4 "SF Mono", Menlo, Consolas, monospace;
-       background: #f3f4f7; padding: .6mm 1.2mm; border-radius: 2px; }
-pre.code { background: #f7f8fa; border: 1px solid var(--rule); border-left: 3px solid var(--accent);
-           border-radius: 3px; padding: 3mm 3.5mm; overflow-x: auto;
-           page-break-inside: avoid; margin: 0 0 4mm; }
-pre.code code { background: none; padding: 0; font-size: 8.6pt; white-space: pre-wrap;
-                word-break: break-word; }
+/* ---------- Code ---------- */
+code { font: 8.8pt/1.4 "SF Mono", Menlo, Consolas, monospace;
+       background: #eef1f6; color: #30363f; padding: .5mm 1.3mm; border-radius: 1.6mm; }
+pre.code { background: var(--ink); border-radius: 2.6mm; padding: 4mm 4.5mm;
+           page-break-inside: avoid; margin: 0 0 5mm; }
+pre.code code { background: none; padding: 0; color: #e8ecf3; font-size: 8.4pt;
+                white-space: pre-wrap; word-break: break-word; }
 
-/* Confidence chips -- the report's own convention, made legible at a glance */
-.chip { display: inline-block; font-size: 7.6pt; font-weight: 700; letter-spacing: .05em;
-        text-transform: uppercase; padding: .5mm 1.8mm; border-radius: 2.6mm;
-        vertical-align: .4mm; white-space: nowrap; }
+/* ---------- Confidence chips ---------- */
+.chip { display: inline-block; font-size: 7.2pt; font-weight: 700; letter-spacing: .06em;
+        text-transform: uppercase; padding: .4mm 1.7mm; border-radius: 2.4mm;
+        vertical-align: .35mm; white-space: nowrap; }
 .chip.obs  { color: var(--obs);  background: var(--obs-bg); }
 .chip.inf  { color: var(--inf);  background: var(--inf-bg); }
 .chip.spec { color: var(--spec); background: var(--spec-bg); }
+.chip-note { font-size: 7.4pt; color: var(--muted); margin-left: 1.1mm; font-style: italic; }
 
-/* Callouts and quotes */
-blockquote { margin: 0 0 4mm; padding: 2mm 0 2mm 4mm; border-left: 3px solid var(--rule);
+/* ---------- Callouts ---------- */
+blockquote { margin: 0 0 4mm; padding: 1mm 0 1mm 4mm; border-left: 3px solid var(--rule);
              color: var(--muted); }
 blockquote p:last-child { margin-bottom: 0; }
-.callout { border: 1px solid var(--rule); border-left: 3px solid var(--accent);
-           background: var(--accent-soft); border-radius: 3px; padding: 3mm 3.5mm;
-           margin: 0 0 4mm; page-break-inside: avoid; }
-.callout-label { font-size: 7.6pt; font-weight: 700; letter-spacing: .1em;
-                 text-transform: uppercase; color: var(--accent); margin-bottom: 1.5mm; }
+.callout { border-radius: 3mm; background: var(--wash); border-left: 3.5px solid var(--accent);
+           padding: 4mm 4.5mm; margin: 0 0 5mm; page-break-inside: avoid; }
+.callout-label { font-size: 7.4pt; font-weight: 700; letter-spacing: .12em;
+                 text-transform: uppercase; color: var(--accent); margin-bottom: 1.8mm; }
 .callout p:last-child { margin-bottom: 0; }
-.callout.warning { border-left-color: #c77700; background: #fdf4e6; }
+.callout.warning { border-left-color: #c77700; background: #fdf5e8; }
 .callout.warning .callout-label { color: #a65f00; }
-.callout.important { border-left-color: #7a3fb8; background: #f5eefc; }
+.callout.important { border-left-color: #7a3fb8; background: #f6eefc; }
 .callout.important .callout-label { color: #6a33a3; }
 
-/* Figures */
-figure { margin: 0 0 4mm; page-break-inside: avoid; }
-figure img { max-width: 100%; height: auto; border: 1px solid var(--rule); border-radius: 3px; }
-figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 1.5mm; }
+/* ---------- Figures ---------- */
+figure { margin: 0 0 5mm; page-break-inside: avoid; }
+figure img { max-width: 100%; height: auto; border: 1px solid var(--rule); border-radius: 2.6mm; }
+figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 1.8mm; }
 .missing-img { font-size: 8.5pt; color: #b00020; }
-
-/* The plain-English opener is the part most readers will actually read. */
-h2.plain + p, h2.plain + p + p { font-size: 11.5pt; line-height: 1.6; }
 """
 
 PAGE = """<!doctype html>
@@ -453,13 +552,16 @@ PAGE = """<!doctype html>
   </div>
   <div class="note">{note}</div>
 </section>
+{toc}
 {body}
 </body></html>
 """
 
-COVER_NOTE = ("Compiled from public, unauthenticated sources: the pages and files this site "
-              "serves to any visitor. Claims are marked observed, inferred or speculative. "
-              "Configuration describes what would happen; it is not proof that it did.")
+COVER_NOTE = ("Built only from public files, the ones this website sends to anyone who "
+              "visits it. Nothing here needed a login. Each point is marked as observed "
+              "(it is in the files), inferred (a fair reading of them) or speculative "
+              "(a guess worth checking). Settings show what a website is set up to do. "
+              "They do not prove it happened.")
 
 
 def build_html(md, base_dir, title=None, subtitle=None, eyebrow="Growth recon"):
@@ -504,9 +606,23 @@ def build_html(md, base_dir, title=None, subtitle=None, eyebrow="Growth recon"):
 
     body_md = "\n".join(lines).strip()
     body = render_markdown(body_md, base_dir)
-    # Mark the plain-English opener so it can be set slightly larger.
+
+    # The plain-English opener is the part most readers will read, and often the
+    # only part, so it gets lifted out of the flow into a panel rather than
+    # being one more section among many.
     body = re.sub(r"<h2>(\s*In plain English\s*)</h2>",
                   r'<h2 class="plain">\1</h2>', body, flags=re.I)
+    body = re.sub(r'(<h2 class="plain">.*?</h2>)(.*?)(?=<h2|\Z)',
+                  r'<section class="plain-panel">\1\2</section>', body, count=1, flags=re.S)
+
+    # A contents page only earns its place in a long report; below a handful of
+    # sections it is just an extra sheet of paper.
+    sections = [re.sub(r"<[^>]+>", "", h).strip()
+                for h in re.findall(r"<h2[^>]*>(.*?)</h2>", body, re.S)]
+    toc = ""
+    if len(sections) >= 5:
+        items = "".join(f"<li>{html_mod.escape(t)}</li>" for t in sections if t)
+        toc = f'<section class="toc"><h2>Contents</h2><ol>{items}</ol></section>'
 
     meta = f"Prepared <b>{html_mod.escape(date.today().isoformat())}</b>"
     return PAGE.format(
@@ -518,6 +634,7 @@ def build_html(md, base_dir, title=None, subtitle=None, eyebrow="Growth recon"):
         subtitle=inline(subtitle, base_dir) if subtitle else "",
         meta=meta,
         note=html_mod.escape(COVER_NOTE),
+        toc=toc,
         body=body,
     )
 
@@ -581,6 +698,12 @@ def main():
 
     imgs = page.count("<figure>")
     print(f"html  {html_path}  ({len(page):,} bytes, {imgs} image{'s' if imgs != 1 else ''} embedded)")
+
+    notes = style_check(md)
+    if notes and "--no-style-check" not in sys.argv:
+        print("\nplain language: this report asks more of a reader than it needs to")
+        for note in notes:
+            print(f"  - {note}")
 
     if "--html-only" in sys.argv:
         return 0

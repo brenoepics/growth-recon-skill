@@ -232,7 +232,9 @@ Reports are written as markdown and rendered to a PDF with a cover page, page nu
 python3 -I scripts/report_pdf.py acme-recon.md
 ```
 
-The confidence markers become coloured chips, so a reader can see at a glance which sentences are evidence and which are interpretation. Rendering uses a headless Chrome, Chromium, Edge or Brave, found automatically; set `CHROME_BIN` to point at a specific one. With no browser available it writes the styled HTML instead and says so, which is still something you can open and print.
+The document opens with a cover, then a contents page, then the plain-English summary set in a panel so it reads first. Confidence markers become coloured chips, so a reader can see at a glance which sentences are evidence and which are interpretation.
+
+The renderer also checks the writing, because these reports are read by people who do not work in analytics. It counts em dashes, flags sentences over 34 words, and suggests shorter words. On one real report that came back as 24 em dashes and a 67-word sentence. Those counts are the difference between a report someone reads and one they skim. Rendering uses a headless Chrome, Chromium, Edge or Brave, found automatically; set `CHROME_BIN` to point at a specific one. With no browser available it writes the styled HTML instead and says so, which is still something you can open and print.
 
 <br>
 
