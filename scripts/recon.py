@@ -1030,6 +1030,11 @@ def render(r):
 
 
 def main():
+    # An explicit --help is a request that succeeded, so it exits 0. Running with
+    # no arguments at all is a usage error and still exits 1.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return 0
     argv = sys.argv[1:]
     if not argv:
         print(__doc__)

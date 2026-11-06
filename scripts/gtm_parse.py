@@ -41,6 +41,15 @@ TAG_TYPES = {
     "__awct": ("Google Ads Conversion Tracking", "google-ads"),
     "__sp": ("Google Ads Remarketing / user list", "google-ads"),
     "__gclidw": ("Conversion Linker", "google-ads"),
+    # Universal Analytics. Sunset July 2023, so its presence dates a container
+    # and its disappearance is usually the clearest single signal in a
+    # historical diff -- one real container shed 273 of these between 2022 and
+    # now. Left unnamed it printed as "Unidentified template", which buried the
+    # most legible finding a diff can produce.
+    "__ua": ("Universal Analytics (legacy, sunset July 2023)", "google"),
+    # The one place a published container admits a tag exists but is switched
+    # off. Its settings are not published, so it is a name and nothing more.
+    "__paused": ("Paused tag (settings not published)", "gtm"),
     "__flc": ("Floodlight Counter", "google-dv360"),
     "__fls": ("Floodlight Sales", "google-dv360"),
     "__ogt_google_signals": ("Google Signals", "google"),
@@ -1008,6 +1017,11 @@ def render(s):
 
 
 def main():
+    # An explicit --help is a request that succeeded, so it exits 0. Running with
+    # no arguments at all is a usage error and still exits 1.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return 0
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if not args:
         print(__doc__)

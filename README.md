@@ -20,7 +20,7 @@ npx skills add brenoepics/growth-recon-skill
 
 A website's tracking configuration is delivered to the browser as a static file, which means it can be read directly. `growth-recon` parses that file and the other public surfaces around it, then reports what a site measures, what it bids toward, which vendors it actually loads, and the conditions a tag waits for before it fires.
 
-It also points you at the ad libraries, where the campaigns that tracking was built to measure are on public display.
+It also watches the page actually run, points you at the ad libraries where the campaigns that tracking was built to measure are on public display, and reads the pricing, hiring and archived history around it.
 
 It works as a skill your agent invokes in conversation, or as two standalone Python scripts.
 
@@ -108,6 +108,15 @@ What is asana.com optimising for in Google Ads?
 What is linear.app A/B testing right now?
 ```
 ```text
+What does zendesk.com charge, and where does self-serve end?
+```
+```text
+What has changed in asana.com's tracking since 2022?
+```
+```text
+Compare asana.com, monday.com and clickup.com on how they measure
+```
+```text
 Audit my own site's public exposure: example.com
 ```
 
@@ -121,6 +130,22 @@ python3 -I scripts/recon.py https://example.com --pages /pricing,/demo
 
 # Parse one tag container
 python3 -I scripts/gtm_parse.py GTM-XXXXXXX
+
+# Decode what actually fired, from a browser capture
+python3 -I scripts/runtime_parse.py captured.json
+
+# Pricing tiers, seat minimums, and the signup form's structure
+python3 -I scripts/pricing.py example.com
+
+# Hiring, mobile apps, public filings
+python3 -I scripts/company.py example.com
+
+# Diff a container against its own archived history
+python3 -I scripts/history.py GTM-XXXXXXX --diff
+
+# Benchmark several companies, or sweep one company's variants
+python3 -I scripts/compare.py a.com b.com c.com
+python3 -I scripts/compare.py --regional example.com
 ```
 
 | Argument | Purpose |
@@ -156,6 +181,23 @@ Ad libraries do not publish spend, bids, targeting outside the EU disclosure, or
 
 <br>
 
+## Beyond the tag container
+
+Five further modules answer what a container cannot. Each runs standalone, and none is needed for a quick lookup.
+
+| Module | Answers | Notable |
+| :--- | :--- | :--- |
+| **Runtime** | What actually fired, and with what values | The only route to real conversion values — one capture showed `value=110.00 USD`, another showed conversions firing at `value=0`, which cannot drive value-based bidding |
+| **Pricing** | What they charge, where self-serve ends | Seat minimums, real annual discounts, tier IDs leaking through CTA links, and the signup form's required fields — read, never filled |
+| **Company** | Who they hire, what they ship, what they file | Job boards name the stack in their requirements and expose internal product lines before the marketing site does |
+| **History** | What changed, and when | Containers are archived by ID, so a diff dates a strategy change — one target kept 15 conversion labels across 8 years while replacing 8 of them |
+| **Compare** | Whether a number is normal | "27 conversion actions" means nothing alone; against four competitors it is the widest optimisation surface in the set |
+
+> [!NOTE]
+> The modules corroborate each other, which is the point. A container gating a paid-lead conversion on company size not being "1-19" is a guess until the signup form turns out to carry exactly that firmographic field. Two independent sources agreeing is worth more than either alone.
+
+<br>
+
 ## What it reports
 
 | Area | Detail |
@@ -167,6 +209,10 @@ Ad libraries do not publish spend, bids, targeting outside the EU disclosure, or
 | **Experiments** | Campaign names from public experiment endpoints, plus test names left behind in lookup tables |
 | **Vendor stack** | Over 100 fingerprints, split into those with load evidence and those that are only a name in the page |
 | **Live ads** | Advertiser identity resolved, with scoped links to each public ad library |
+| **Runtime** | Events, values and consent state decoded from a real page load |
+| **Pricing** | Tiers, billing periods, seat minimums, and the self-serve/sales boundary |
+| **Company** | Open roles by function, app portfolio and cadence, filings |
+| **History** | What a container gained and lost between two dates, and publish velocity |
 | **Content posture** | Sitemap inventory, disallowed directories, targeted competitors, AI-crawler rules |
 | **Consent** | Which tags declare consent requirements, which types, and the CMP in use |
 
@@ -200,6 +246,11 @@ Container data invites a few confident errors. The parser is built to avoid them
 | Classic conversion tags | The full optimisation surface | An undercount, when conversions route through GA4 or server-side |
 | A `__tg` entry | An unknown ad vendor | A trigger group. Several built-in types read like vendors |
 | A vendor name in the page | A vendor in the stack | Often copy in the site's own integrations directory |
+| A brand's country domain | Their regional site | Frequently a different company — one target's `.com.br` serves an unrelated business |
+| A job board matching the domain | Their hiring | A guessed ATS token can resolve to someone else's live board |
+| An empty browser network log | No third-party tracking | The reader returns same-origin requests only; use performance entries |
+| A value on a product view | Revenue, or what a conversion is worth | A catalogue price |
+| An archive gap | A quiet period | A gap in the archive |
 
 <br>
 
@@ -247,9 +298,14 @@ Bid-level questions are answered by auction insights and public ad libraries, no
 | `SKILL.md` | The workflow an agent follows |
 | `scripts/recon.py` | Collects page, headers, CSP, robots, sitemap, DNS, vendors, containers |
 | `scripts/gtm_parse.py` | Parses a container: tags, triggers, lookup tables, conversions, consent |
-| `references/` | Field map, endpoint catalogue, vendor meanings, report template |
+| `scripts/runtime_parse.py` | Decodes captured requests and dataLayer pushes into what fired |
+| `scripts/pricing.py` | Pricing tiers, seat minimums, signup form structure |
+| `scripts/company.py` | Hiring, mobile apps, public filings |
+| `scripts/history.py` | Archived container snapshots and diffs |
+| `scripts/compare.py` | Multi-target benchmarking and variant sweeps |
+| `references/` | Field map, endpoint catalogue, vendor meanings, runtime method, report template |
 
-Ten files, no build step, no lockfile.
+No build step, no lockfile, no dependencies.
 
 <br>
 
