@@ -1,0 +1,1174 @@
+       #!/usr/bin/env python3
+    3: """Decode captured browser requests and dataLayer dumps into what actually fired.
+       
+       The container read tells you what *would* fire. This tells you what *did*, on one
+       visit, with the numbers attached -- because conversion values are pushed from the
+       dataLayer at runtime and never appear in the published container. A measurement
+       hit carries them in the query string, so a saved network capture answers the one
+       question static configuration cannot.
+       
+       Usage:
+           python3 runtime_parse.py capture.json                  # requests, dataLayer, or both
+           python3 runtime_parse.py requests.json --datalayer dl.json
+           python3 runtime_parse.py capture.json --json           # machine-readable
+       
+       Input is deliberately sloppy-tolerant, because capture formats vary by tool:
+         - a JSON array of URL strings
+         - a JSON array of request objects (`url`, or `name` as performance.getEntries
+           gives it, or HAR's nested `request.url`)
+         - a HAR file (`{"log": {"entries": [...]}}`)
+         - a JSON array of dataLayer pushes
+         - one object holding any mix of the above under `requests` / `dataLayer`
+         - a plain text file with one URL per line
+       
+       Honest limits (see references/runtime-observation.md for the full list):
+         - One capture is one session, from one geo, under one consent state. Absence of
+           a hit is not evidence the tag does not exist.
+         - A value in a hit is the value *they computed for this pageview*. It is not
+           their CAC, their bid, or their margin.
+         - POST bodies (TikTok, Clarity, server-side endpoints) carry their payload
+           outside the URL. Unless the capture saved the body, those hits are reported
+           as fired-with-payload-unseen rather than guessed at.
+       """
+       
+    3: import base64
+    3: import json
+    3: import re
+    3: import sys
+    3: import urllib.parse
+    3: from collections import Counter, OrderedDict
+       
+       # ---------------------------------------------------------------------------
+       # What a value param is called, per vendor. Order matters: the first key present
+       # wins, so the most specific/authoritative name for that vendor goes first.
+       # `epn.value` beats `ep.value` because GA4's epn.* namespace is the numeric one;
+       # a value arriving in ep.* was sent as a string, which is worth knowing because
+       # it is a common cause of a platform refusing to use it for bidding.
+       # ---------------------------------------------------------------------------
+    3: GA4_VALUE_KEYS = ["epn.value", "ep.value", "val", "epn.revenue", "ep.revenue"]
+    3: ADS_VALUE_KEYS = ["value", "epn.value", "ep.value", "cost"]
+    3: ADS_CURRENCY_KEYS = ["currency_code", "currency", "cu", "epn.currency", "ep.currency"]
+    3: GA4_CURRENCY_KEYS = ["cu", "ep.currency", "epn.currency"]
+       
+       # GA4 packs each ecommerce item into one pr<N> param as `~`-separated fields with
+       # a two-character type prefix. Without this map the richest part of a purchase
+       # hit -- the actual basket, with per-item prices -- reads as line noise.
+   57: GA4_ITEM_PREFIXES = {
+   12:     "id": "item_id", "nm": "item_name", "br": "item_brand", "ca": "item_category",
+    9:     "c2": "item_category2", "c3": "item_category3", "c4": "item_category4",
+   12:     "c5": "item_category5", "va": "item_variant", "pr": "price", "qt": "quantity",
+   12:     "ds": "discount", "af": "affiliation", "cp": "coupon", "ln": "item_list_name",
+    9:     "li": "item_list_id", "lp": "index", "pi": "promotion_id", "pn": "promotion_name",
+    3:     "cn": "creative_name", "cs": "creative_slot", "lo": "location_id",
+       }
+       
+       # Params that mean "a person was identified or matched", never printed by value.
+       # Presence is the finding; the value is someone's hashed email and none of our
+       # business. Scanning for these is how you tell enhanced conversions / CAPI
+       # matching apart from plain pageview tracking.
+    3: USER_DATA_KEYS = {
+    3:     "uid": "GA4 user_id set",
+    3:     "ga_uid": "GA4 user id passed to Google Ads",
+    3:     "em": "hashed email (enhanced conversions)",
+    3:     "emd": "hashed email, deduped (enhanced conversions)",
+    3:     "ph": "hashed phone (enhanced conversions)",
+    3:     "fn": "hashed first name (enhanced conversions)",
+    3:     "sn": "hashed surname (enhanced conversions)",
+    3:     "ec_mode": "enhanced conversions mode declared",
+    3:     "oid": "order id (deduplication / offline matching)",
+    3:     "eid": "event id (browser<->server deduplication, i.e. a CAPI pair exists)",
+    3:     "external_id": "first-party id shared with the platform",
+    3:     "pd": "hashed partner data",
+    3:     "udff": "user-data fields flag",
+       }
+       
+       # Script/loader URLs. These prove a vendor is live and hand over an account ID,
+       # but they are not events -- counting them as "what fired" inflates the picture,
+       # which is the main way a runtime read gets overclaimed.
+    3: LOADER_PATTERNS = [
+           (r"googletagmanager\.com/gtm\.js", "GTM container loaded", r"id=(GTM-[A-Z0-9]+)"),
+           (r"googletagmanager\.com/gtag/js", "Google tag loaded", r"id=((?:G|AW|GT|DC)-[A-Z0-9-]+)"),
+           (r"connect\.facebook\.net/signals/config/(\d+)", "Meta pixel config loaded", r"config/(\d+)"),
+           (r"connect\.facebook\.net/.*/fbevents\.js", "Meta pixel library loaded", None),
+           (r"analytics\.tiktok\.com/i18n/pixel/events\.js", "TikTok pixel loaded", r"sdkid=([A-Z0-9]+)"),
+           (r"snap\.licdn\.com/li\.lms-analytics", "LinkedIn Insight loaded", None),
+           (r"bat\.bing\.com/(?:bat\.js|p/action/(\d+))", "Microsoft UET loaded", r"action/(\d+)"),
+           (r"s\.pinimg\.com/ct/core", "Pinterest tag loaded", None),
+           (r"clarity\.ms/tag/([a-z0-9]+)", "Microsoft Clarity loaded", r"tag/([a-z0-9]+)"),
+           (r"static\.ads-twitter\.com", "X/Twitter tag loaded", None),
+           (r"sc-static\.net/scevent", "Snapchat pixel loaded", None),
+           (r"cdn\.optimizely\.com", "Optimizely loaded", None),
+           (r"cdn\.cookielaw\.org|cookiebot|usercentrics|didomi", "consent platform loaded", None),
+       ]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Loading. Be liberal: the capture comes from whatever tool the agent had, and a
+       # parser that rejects a shape it has not seen before just sends them back to the
+       # browser to re-capture.
+       # ---------------------------------------------------------------------------
+    3: URL_KEYS = ("url", "name", "requestUrl", "request_url", "href", "uri", "link")
+    3: BODY_KEYS = ("body", "postData", "post_data", "requestBody", "payload", "postBody")
+       
+       
+    3: def _url_of(obj):
+           """Find a URL in a request-shaped dict, whatever the capture tool called it."""
+  117:     for k in URL_KEYS:
+  106:         v = obj.get(k)
+  106:         if isinstance(v, str) and v.startswith(("http://", "https://", "//")):
+   29:             return v
+   11:     req = obj.get("request")
+   11:     if isinstance(req, dict):
+    5:         return _url_of(req)
+    6:     return None
+       
+       
+    3: def _body_of(obj):
+           """Pull a POST body out, accepting HAR's {"text": ...} wrapper."""
+  238:     for k in BODY_KEYS:
+  204:         v = obj.get(k)
+  204:         if isinstance(v, str) and v.strip():
+                   return v
+  204:         if isinstance(v, dict):
+                   t = v.get("text") or v.get("raw")
+                   if isinstance(t, str) and t.strip():
+                       return t
+                   if v:
+                       return json.dumps(v)
+   34:     req = obj.get("request")
+   34:     if isinstance(req, dict):
+    5:         return _body_of(req)
+   29:     return None
+       
+       
+    3: def _looks_like_request(obj):
+           """Tell a captured request from a dataLayer push.
+       
+           Both are plain objects and a dataLayer push can legitimately carry a `url`
+           key, so a url alone is not enough; the GTM-specific keys are the tiebreak.
+           """
+   41:     if not isinstance(obj, dict):
+               return False
+  290:     if any(k in obj for k in ("method", "status", "initiatorType", "resourceType",
+                                     "response", "statusCode", "mimeType")):
+   29:         return True
+   12:     if "request" in obj and isinstance(obj["request"], dict):
+               return True
+   72:     if any(k in obj for k in ("event", "ecommerce", "gtm.start", "gtm.uniqueEventId")):
+    6:         return False
+    6:     return _url_of(obj) is not None
+       
+       
+    3: def _collect(node, requests, pushes, depth=0):
+           """Walk an arbitrary decoded JSON structure, sorting what it finds."""
+    4:     if depth > 6:
+               return
+    4:     if isinstance(node, str):
+               if node.startswith(("http://", "https://")):
+                   requests.append({"url": node})
+               return
+    4:     if isinstance(node, list):
+   44:         for item in node:
+   41:             if isinstance(item, (str, list)):
+                       _collect(item, requests, pushes, depth + 1)
+   41:             elif isinstance(item, dict):
+   41:                 if _looks_like_request(item):
+   29:                     requests.append(item)
+                       else:
+   12:                     pushes.append(item)
+    3:         return
+    1:     if isinstance(node, dict):
+               # A HAR file, or a hand-rolled wrapper object.
+    1:         if isinstance(node.get("log"), dict):
+    1:             _collect(node["log"].get("entries") or [], requests, pushes, depth + 1)
+    8:         for key in ("requests", "entries", "network", "networkRequests", "hits",
+                           "resources", "har"):
+    7:             if key in node:
+                       _collect(node[key], requests, pushes, depth + 1)
+    6:         for key in ("dataLayer", "datalayer", "data_layer", "pushes", "dl"):
+    5:             if key in node:
+                       val = node[key]
+                       if isinstance(val, list):
+                           pushes.extend(x for x in val if isinstance(x, dict))
+    2:         if not any(k in node for k in ("log", "requests", "entries", "network",
+                                              "networkRequests", "hits", "resources", "har",
+                                              "dataLayer", "datalayer", "data_layer",
+                                              "pushes", "dl")):
+                   if _looks_like_request(node):
+                       requests.append(node)
+                   else:
+                       pushes.append(node)
+       
+       
+    3: def load_capture(path):
+           """Read one capture file. Returns (requests, dataLayer pushes, notes)."""
+    3:     notes = []
+    3:     try:
+    6:         with open(path, encoding="utf-8", errors="replace") as fh:
+    3:             raw = fh.read()
+           except OSError as e:
+               return [], [], [f"!! could not read {path}: {e}"]
+    3:     if not raw.strip():
+               return [], [], [f"!! {path} is empty"]
+       
+    3:     requests, pushes = [], []
+    3:     try:
+    3:         data = json.loads(raw)
+           except ValueError:
+               # Not JSON. A pasted list of URLs is a perfectly reasonable capture, and
+               # so is JSON-lines, so pull URLs out line by line instead of refusing.
+               for line in raw.splitlines():
+                   line = line.strip().strip(",").strip('"')
+                   if line.startswith("{"):
+                       try:
+                           obj = json.loads(line)
+                       except ValueError:
+                           continue
+                       (requests if _looks_like_request(obj) else pushes).append(obj)
+                       continue
+                   m = re.search(r"https?://\S+", line)
+                   if m:
+                       requests.append({"url": m.group(0).rstrip('",;)')})
+               notes.append(f"{path} is not JSON -- read {len(requests)} URL(s) line by line")
+               return requests, pushes, notes
+       
+    3:     _collect(data, requests, pushes)
+    3:     return requests, pushes, notes
+       
+       
+       # ---------------------------------------------------------------------------
+       # Query-string handling. Two wrinkles the obvious implementation gets wrong:
+       # Floodlight separates its params with ';' instead of '&', and GA4 sends repeated
+       # pr<N> params that must not collapse into one.
+       # ---------------------------------------------------------------------------
+    3: def parse_params(url):
+   29:     try:
+   29:         parsed = urllib.parse.urlsplit(url)
+           except ValueError:
+               return {}, "", ""
+   29:     host, path, query = parsed.netloc.lower(), parsed.path, parsed.query
+       
+           # Floodlight puts its payload in the PATH as ;key=value pairs (and some
+           # Google Ads endpoints do too), so the standard parser sees no query at all.
+   29:     semi = ""
+   29:     if ";" in path:
+    3:         path, _, semi = path.partition(";")
+   29:     blob = query if query else ""
+   29:     if semi:
+    3:         blob = (blob + "&" if blob else "") + semi.replace(";", "&")
+       
+   29:     out = OrderedDict()
+  436:     for part in re.split(r"[&]", blob):
+  407:         if not part:
+    4:             continue
+  403:         k, _, v = part.partition("=")
+  403:         k = urllib.parse.unquote_plus(k)
+  403:         v = urllib.parse.unquote_plus(v)
+  403:         if k in out and out[k] != v:
+                   out[k] = out[k] + " | " + v
+               else:
+  403:             out[k] = v
+   29:     return out, host, path
+       
+       
+    3: def as_number(raw):
+           """Parse a value param. Returns (float|None, state).
+       
+           The state is the point of the whole exercise: a hit that carries `value=` with
+           nothing in it is a different and more interesting finding than a hit with no
+           value param at all, because it means the plumbing is there and the number is
+           not arriving.
+           """
+   11:     if raw is None:
+               return None, "absent"
+   11:     s = str(raw).strip()
+   11:     if not s:
+               return None, "present-but-empty"
+   11:     s = s.replace(",", "") if re.fullmatch(r"-?\d{1,3}(,\d{3})*(\.\d+)?", s) else s
+   11:     try:
+   11:         return float(s), "number"
+           except ValueError:
+               return None, "present-but-not-numeric"
+       
+       
+    3: def pick_value(params, keys):
+   69:     for k in keys:
+   55:         if k in params:
+    7:             num, state = as_number(params[k])
+    7:             return {"value": num, "state": state, "source": k, "raw": params[k][:60]}
+   14:     return {"value": None, "state": "absent", "source": None, "raw": None}
+       
+       
+    3: def pick_currency(params, keys):
+   85:     for k in keys:
+   66:         v = (params.get(k) or "").strip()
+   66:         if v:
+    2:             return v.upper()[:8]
+   19:     return None
+       
+       
+    3: def decode_gcs(gcs):
+           """Decode Google's consent signal string, e.g. G111.
+       
+           Format is 'G' + format version + ad_storage + analytics_storage, each 1 or 0.
+           Reported only when it is that exact shape; Google has changed this before and
+           a mis-decoded consent state is worse than a raw one.
+           """
+   24:     if not isinstance(gcs, str) or not re.fullmatch(r"G\d{3}", gcs):
+    9:         return None
+   15:     m = {"1": "granted", "0": "denied"}
+   30:     return {"ad_storage": m.get(gcs[2], gcs[2]),
+   15:             "analytics_storage": m.get(gcs[3], gcs[3])}
+       
+       
+    3: def decode_ga4_items(params):
+           """Decode pr1..prN into readable items."""
+    6:     items = []
+  157:     for key in sorted((k for k in params if re.fullmatch(r"pr\d+", k)),
+    7:                       key=lambda k: int(k[2:])):
+    1:         item = {}
+    1:         custom = {}
+   13:         for field in params[key].split("~"):
+   12:             if len(field) < 2:
+                       continue
+   12:             prefix, val = field[:2], field[2:]
+   12:             if re.fullmatch(r"k\d", prefix):
+    2:                 custom.setdefault(prefix[1], {})["key"] = val
+   10:             elif re.fullmatch(r"v\d", prefix):
+    2:                 custom.setdefault(prefix[1], {})["value"] = val
+                   else:
+    8:                 name = GA4_ITEM_PREFIXES.get(prefix)
+    8:                 if name and val != "":
+    6:                     item[name] = val
+    3:         for slot in custom.values():
+    2:             if slot.get("key"):
+    2:                 item[slot["key"]] = slot.get("value", "")
+    1:         if item:
+    1:             items.append(item)
+    6:     return items
+       
+       
+    3: def decode_semicolon_blob(raw):
+           """Google Ads remarketing packs its custom params into one `data=` string as
+           `key=value;key=value`. It routinely carries the page type, product id and the
+           business vertical -- their own segmentation, in their own words."""
+    2:     out = OrderedDict()
+   14:     for part in str(raw).split(";"):
+   12:         k, _, v = part.partition("=")
+   12:         if k.strip():
+   12:             out[k.strip()] = v.strip()
+    2:     return out
+       
+       
+    3: def try_base64_json(raw):
+           """Some Google endpoints carry a base64 JSON blob (`sdl`) listing the page's
+           products with prices. Attempted only where it is cheap, and silently skipped
+           when it is not that -- most base64-looking params are opaque ids."""
+           s = str(raw)
+           if len(s) < 24 or not re.fullmatch(r"[A-Za-z0-9+/_=-]+", s):
+               return None
+           try:
+               pad = "=" * (-len(s) % 4)
+               text = base64.urlsafe_b64decode(s + pad).decode("utf-8", errors="strict")
+           except Exception:
+               return None
+           try:
+               return json.loads(text)
+           except ValueError:
+               return None
+       
+       
+    3: def user_data_present(params):
+  819:     return [f"{k} ({USER_DATA_KEYS[k]})" for k in params
+  408:             if k in USER_DATA_KEYS and str(params[k]).strip()]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Per-vendor decoders. Each returns a hit dict or None.
+       #
+       # Routing is by `tid` prefix before host, deliberately: /ccm/collect is served
+       # from google.com, pagead2.googlesyndication.com and others, and carries GA4
+       # hits (tid=G-) and Google Ads hits (tid=AW-) through the same path. Routing on
+       # the host alone mislabels every Ads conversion on a modern gtag site.
+       # ---------------------------------------------------------------------------
+    3: def _base_hit(vendor, endpoint, url, params):
+   21:     gcs = params.get("gcs")
+   21:     return {
+   21:         "vendor": vendor,
+   21:         "endpoint": endpoint,
+   21:         "event": None,
+   21:         "account": None,
+   21:         "value": None,
+   21:         "value_state": "absent",
+   21:         "value_source": None,
+   21:         "currency": None,
+   21:         "items": [],
+   21:         "event_params": {},
+   21:         "user_data": user_data_present(params),
+   42:         "consent": {"gcs": gcs, "gcs_decoded": decode_gcs(gcs),
+   21:                     "gcd_raw": params.get("gcd"),
+   21:                     "npa": params.get("npa")},
+   21:         "page": params.get("dl") or params.get("url") or params.get("p") or params.get("~oref"),
+   21:         "notes": [],
+   21:         "url": url[:400],
+           }
+       
+       
+    3: def decode_google_collect(url, host, path, params):
+           """GA4 and gtag-routed Google Ads hits: /g/collect, /collect, /ccm/collect."""
+    6:     tid = params.get("tid") or params.get("tids") or ""
+    6:     is_ads = tid.startswith(("AW-", "DC-"))
+    6:     vendor = "Google Ads (gtag)" if is_ads else "GA4"
+    6:     hit = _base_hit(vendor, host + path, url, params)
+    6:     hit["account"] = tid or None
+    6:     hit["event"] = params.get("en") or None
+    6:     v = pick_value(params, ADS_VALUE_KEYS if is_ads else GA4_VALUE_KEYS)
+    6:     hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+    6:     hit["currency"] = pick_currency(params, ADS_CURRENCY_KEYS if is_ads else GA4_CURRENCY_KEYS)
+    6:     hit["items"] = decode_ga4_items(params)
+  282:     hit["event_params"] = {k.split(".", 1)[1]: val for k, val in params.items()
+  138:                            if k.startswith(("ep.", "epn.", "up.", "upn."))}
+    6:     if not tid:
+               hit["notes"].append("no tid in this hit -- destination property not identifiable")
+    6:     if v["source"] == "ep.value":
+    2:         hit["notes"].append("value arrived in ep.* (string namespace), not epn.* (numeric)")
+    6:     if "sdl" in params:
+               blob = try_base64_json(params["sdl"])
+               if blob is not None:
+                   hit["notes"].append("sdl= carries a base64 JSON product list")
+                   hit["decoded_extras"] = {"sdl": blob}
+    6:     return hit
+       
+       
+    3: def decode_google_ads_conversion(url, host, path, params):
+           """googleadservices /pagead/conversion, doubleclick viewthroughconversion,
+           rmkt/collect and 1p-user-list. Conversion id is in the path, label in a param."""
+   14:     m = re.search(r"/(?:pagead/conversion|pagead/viewthroughconversion|rmkt/collect|"
+    7:                   r"pagead/1p-user-list|pagead/landing)/(\d{6,12})", path)
+    7:     conv_id = m.group(1) if m else (params.get("tid") or "").replace("AW-", "") or None
+   11:     kind = ("conversion" if "pagead/conversion" in path else
+    4:             "remarketing / view-through" if "viewthroughconversion" in path or "rmkt" in path else
+    1:             "user list (audience)" if "1p-user-list" in path else "ads")
+    7:     hit = _base_hit("Google Ads", host + path, url, params)
+    7:     hit["account"] = f"AW-{conv_id}" if conv_id else None
+    7:     hit["event"] = params.get("en") or kind
+    7:     hit["conversion_label"] = params.get("label") or None
+    7:     hit["conversion_kind"] = kind
+    7:     v = pick_value(params, ADS_VALUE_KEYS)
+    7:     hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+    7:     hit["currency"] = pick_currency(params, ADS_CURRENCY_KEYS)
+    7:     if params.get("bttype"):
+    3:         hit["notes"].append(f"conversion type declared as '{params['bttype']}'")
+    7:     if params.get("data"):
+    2:         hit["event_params"] = decode_semicolon_blob(params["data"])
+    7:     if kind == "user list (audience)":
+    1:         hit["notes"].append("audience membership ping, not a conversion -- do not count it as one")
+           # A conversion that reports 0 is not a broken value; it is a deliberate
+           # choice, and it says this action is not feeding value-based bidding.
+    7:     if hit["value_state"] == "number" and hit["value"] == 0:
+    2:         hit["notes"].append("value is exactly 0 -- this action reports no revenue, so it "
+                                   "cannot be driving value-based bidding")
+    7:     if hit["conversion_label"] is None and kind == "conversion":
+               hit["notes"].append("no label param -- conversion action not identifiable from this hit")
+    7:     return hit
+       
+       
+    3: def decode_floodlight(url, host, path, params):
+    3:     hit = _base_hit("Floodlight (DV360/CM360)", host + path, url, params)
+    3:     hit["account"] = params.get("src") and f"DC-{params['src']}" or None
+   12:     hit["event"] = "/".join(x for x in (params.get("type"), params.get("cat")) if x) or None
+    3:     v = pick_value(params, ["cost", "value", "u1"])
+    3:     hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+    3:     hit["currency"] = pick_currency(params, ["currency_code", "currency"])
+    3:     if params.get("qty"):
+               hit["event_params"]["qty"] = params["qty"]
+   44:     for k, val in params.items():
+   41:         if re.fullmatch(r"u\d{1,2}", k) and val:
+                   hit["event_params"][k] = val
+    3:     hit["notes"].append("type/cat are the Floodlight group and activity tags -- "
+                               "their own names for this activity")
+    3:     return hit
+       
+       
+    3: def decode_meta(url, host, path, params):
+           hit = _base_hit("Meta pixel", host + path, url, params)
+           hit["account"] = params.get("id") or None
+           hit["event"] = params.get("ev") or None
+           v = pick_value(params, ["cd[value]", "cd[value][value]", "value"])
+           hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+           hit["currency"] = pick_currency(params, ["cd[currency]", "currency"])
+           hit["event_params"] = {k[3:-1]: val for k, val in params.items()
+                                  if k.startswith("cd[") and k.endswith("]")}
+           if params.get("eid"):
+               hit["notes"].append("eid present -- browser and Conversions API hits are being deduped, "
+                                   "so a server-side copy of this event exists")
+           return hit
+       
+       
+    3: def decode_uet(url, host, path, params):
+    2:     hit = _base_hit("Microsoft UET", host + path, url, params)
+    2:     hit["account"] = params.get("ti") or None
+    2:     hit["event"] = params.get("evt") or params.get("ea") or None
+           # gv is UET's revenue field; ev is the generic event value. Both are numeric
+           # and sites use them inconsistently, so report which one carried the number.
+    2:     v = pick_value(params, ["gv", "ev", "revenue_value"])
+    2:     hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+    2:     hit["currency"] = pick_currency(params, ["gc", "currency"])
+    8:     for k in ("ec", "ea", "el"):
+    6:         if params.get(k):
+                   hit["event_params"][{"ec": "category", "ea": "action", "el": "label"}[k]] = params[k]
+    2:     if params.get("msclkid") and params["msclkid"] not in ("N", ""):
+               hit["notes"].append("msclkid present -- this visit arrived from a Microsoft ad click")
+    2:     return hit
+       
+       
+    3: def decode_linkedin(url, host, path, params):
+           hit = _base_hit("LinkedIn", host + path, url, params)
+           hit["account"] = params.get("pid") or None
+           hit["event"] = ("conversion" if params.get("conversionId") else
+                           params.get("event") or "insight ping")
+           if params.get("conversionId"):
+               hit["conversion_label"] = params["conversionId"]
+           v = pick_value(params, ["value", "conversionValue", "amount"])
+           hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+           hit["currency"] = pick_currency(params, ["currency", "currencyCode"])
+           return hit
+       
+       
+    3: def decode_tiktok(url, host, path, params, body=None):
+    1:     hit = _base_hit("TikTok", host + path, url, params)
+    1:     hit["account"] = params.get("sdkid") or params.get("pixel_code") or None
+    1:     hit["event"] = params.get("event") or None
+    1:     payload = None
+    1:     if body:
+               try:
+                   payload = json.loads(body)
+               except ValueError:
+                   payload = None
+    1:     if isinstance(payload, list) and payload:
+               payload = payload[0]
+    1:     if isinstance(payload, dict):
+               hit["event"] = payload.get("event") or hit["event"]
+               ctx = payload.get("context") or {}
+               pixel = (ctx.get("pixel") or {}) if isinstance(ctx, dict) else {}
+               hit["account"] = pixel.get("code") or hit["account"]
+               props = payload.get("properties") or {}
+               if isinstance(props, dict):
+                   v = pick_value(props, ["value", "price"])
+                   hit.update({"value": v["value"], "value_state": v["state"],
+                               "value_source": v["source"]})
+                   hit["currency"] = pick_currency(props, ["currency"])
+                   hit["event_params"] = {k: str(val)[:120] for k, val in props.items()
+                                          if k not in ("value", "currency")}
+    1:     elif path.rstrip("/").endswith(("/pixel", "/track")):
+    1:         hit["notes"].append("TikTok posts its payload in the request body -- "
+                                   "event and value are not in the URL and were not captured")
+    1:     return hit
+       
+       
+    3: def decode_pinterest(url, host, path, params):
+    2:     hit = _base_hit("Pinterest", host + path, url, params)
+    2:     hit["account"] = params.get("tid") or None
+    2:     hit["event"] = params.get("event") or None
+    2:     v = pick_value(params, ["value"])
+    2:     hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+    2:     hit["currency"] = pick_currency(params, ["currency"])
+           # Pinterest nests event data as a JSON blob in `ed`, where the value lives.
+    2:     if params.get("ed"):
+    1:         try:
+    1:             ed = json.loads(params["ed"])
+               except ValueError:
+                   ed = None
+    1:         if isinstance(ed, dict):
+    1:             v = pick_value(ed, ["value", "order_value"])
+    1:             if v["state"] != "absent":
+                       hit.update({"value": v["value"], "value_state": v["state"],
+                                   "value_source": "ed." + str(v["source"])})
+    1:             hit["currency"] = hit["currency"] or pick_currency(ed, ["currency"])
+    3:             hit["event_params"] = {k: str(val)[:120] for k, val in ed.items()
+    1:                                   if k not in ("value", "currency")}
+    2:     return hit
+       
+       
+    3: def decode_reddit(url, host, path, params):
+           hit = _base_hit("Reddit", host + path, url, params)
+           hit["account"] = params.get("id") or params.get("advertiser_id") or None
+           hit["event"] = params.get("event") or params.get("ev") or None
+           v = pick_value(params, ["m.value", "value", "conversion_value"])
+           hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+           hit["currency"] = pick_currency(params, ["m.currency", "currency"])
+           return hit
+       
+       
+    3: def decode_snapchat(url, host, path, params):
+           hit = _base_hit("Snapchat", host + path, url, params)
+           hit["account"] = params.get("pid") or None
+           hit["event"] = params.get("ev") or None
+           v = pick_value(params, ["price", "value"])
+           hit.update({"value": v["value"], "value_state": v["state"], "value_source": v["source"]})
+           hit["currency"] = pick_currency(params, ["currency"])
+           return hit
+       
+       
+       # Host/path -> decoder. Checked in order, so the specific Google endpoints are
+       # matched before the generic /collect rule.
+    3: ROUTES = [
+    3:     (r"doubleclick\.net/(?:activity|activityi)|\.fls\.doubleclick\.net", decode_floodlight),
+    6:     (r"/pagead/conversion/|/pagead/viewthroughconversion/|/rmkt/collect/|/pagead/1p-user-list/",
+    3:      decode_google_ads_conversion),
+    3:     (r"/g/collect|/ccm/collect|/ccm/s/collect|/mp/collect", decode_google_collect),
+    3:     (r"facebook\.com/tr", decode_meta),
+    3:     (r"bat\.bing\.com/action", decode_uet),
+    3:     (r"ads\.linkedin\.com|px\.ads\.linkedin\.com", decode_linkedin),
+    3:     (r"analytics\.tiktok\.com/api|tiktokw\.us/api", decode_tiktok),
+    3:     (r"ct\.pinterest\.com", decode_pinterest),
+    3:     (r"redditmedia\.com|alb\.reddit\.com", decode_reddit),
+    3:     (r"tr\.snapchat\.com", decode_snapchat),
+       ]
+       
+       
+    3: def is_bare_ga_collect(path, params):
+           """A plain `/collect` path is only a GA hit when its params say so.
+       
+           Server-side GTM moves collection onto the target's own domain, so the hit can
+           arrive at `theircdn.example.com/collect` with nothing Google-shaped about the
+           host. Matching the path alone instead swallows every unrelated `/collect`
+           endpoint (Microsoft Clarity serves one), so require the GA payload shape.
+           """
+    8:     if not re.search(r"/collect/?$", path):
+    7:         return False
+    1:     tid = params.get("tid") or ""
+    2:     return bool(params.get("v") == "2" or params.get("en")
+    1:                 or tid.startswith(("G-", "AW-", "UA-", "DC-", "GT-")))
+       
+       
+    3: def classify_loader(url):
+   56:     for pattern, label, id_pat in LOADER_PATTERNS:
+   53:         if re.search(pattern, url, re.I):
+    5:             ident = None
+    5:             if id_pat:
+    5:                 m = re.search(id_pat, url)
+    5:                 ident = m.group(1) if m else None
+    5:             return {"what": label, "id": ident, "url": url[:200]}
+    3:     return None
+       
+       
+    3: def decode_request(obj):
+           """Decode one captured request. Returns ("hit"|"loader"|"other", payload)."""
+   29:     url = _url_of(obj) if isinstance(obj, dict) else None
+   29:     if not url:
+               return "other", {"reason": "no URL found in this entry",
+                                "entry": json.dumps(obj, default=str)[:160]}
+   29:     if url.startswith("//"):
+               url = "https:" + url
+   29:     params, host, path = parse_params(url)
+   29:     body = _body_of(obj) if isinstance(obj, dict) else None
+   29:     target = host + path
+       
+   29:     matched = None
+  156:     for pattern, fn in ROUTES:
+  148:         if re.search(pattern, target, re.I) or re.search(pattern, url, re.I):
+   21:             matched = fn
+   21:             break
+   29:     if matched is None and is_bare_ga_collect(path, params):
+               matched = decode_google_collect
+   29:     if matched is not None:
+   21:         try:
+   21:             hit = (matched(url, host, path, params, body)
+   21:                    if matched is decode_tiktok else matched(url, host, path, params))
+               except Exception as e:
+                   return "other", {"reason": f"decoder failed: {e}", "entry": url[:160]}
+   21:         method = (obj.get("method") or "GET").upper() if isinstance(obj, dict) else "GET"
+   21:         if method != "GET" and not params and not body:
+    2:             hit["notes"].append(
+    1:                 f"{method} with no captured body -- it fired, but its payload "
+                       f"(event, value) was not recorded")
+   21:         return "hit", hit
+       
+    8:     loader = classify_loader(url)
+    8:     if loader:
+    5:         return "loader", loader
+    3:     return "other", {"reason": "not a known measurement endpoint", "entry": url[:200]}
+       
+       
+       # ---------------------------------------------------------------------------
+       # dataLayer. This is where the values the container could only reference as
+       # {{variable}} are sitting as literals, so it is read for numbers first.
+       # ---------------------------------------------------------------------------
+    3: VALUE_PATHS = [
+           ("ecommerce.value", ("ecommerce", "value")),
+           ("ecommerce.purchase.actionField.revenue", ("ecommerce", "purchase", "actionField", "revenue")),
+           ("ecommerce.checkout.actionField.revenue", ("ecommerce", "checkout", "actionField", "revenue")),
+           ("ecommerce.transaction_total", ("ecommerce", "transaction_total")),
+           ("value", ("value",)),
+           ("conversionValue", ("conversionValue",)),
+           ("conversion_value", ("conversion_value",)),
+           ("lead_value", ("lead_value",)),
+           ("revenue", ("revenue",)),
+           ("cart_total", ("cart_total",)),
+           ("order_total", ("order_total",)),
+           ("price", ("price",)),
+       ]
+    3: CURRENCY_PATHS = [
+           ("ecommerce", "currency"), ("ecommerce", "currencyCode"),
+           ("currency",), ("currencyCode",), ("ecommerce", "purchase", "actionField", "currency"),
+       ]
+       # Product arrays, GA4 and legacy Enhanced Ecommerce. Both are still live in the
+       # wild -- Shopify dataLayer apps in particular still push the legacy `detail`
+       # and `purchase` shapes, which a GA4-only reader would walk straight past.
+    3: PRODUCT_PATHS = [
+           ("ecommerce", "items"),
+           ("ecommerce", "detail", "products"), ("ecommerce", "add", "products"),
+           ("ecommerce", "remove", "products"), ("ecommerce", "checkout", "products"),
+           ("ecommerce", "purchase", "products"), ("ecommerce", "impressions"),
+           ("ecommerce", "click", "products"), ("ecommerce", "cart_contents", "products"),
+       ]
+       # Keys whose values are a person's data. Reported as present, never printed.
+    6: PII_KEY_RE = re.compile(r"(^|_)(email|e_mail|phone|tel|first_?name|last_?name|surname|"
+    3:                         r"address|zip|postcode|dob|birth|ssn|user_email)($|_)", re.I)
+       
+       
+    3: def _dig(obj, path):
+  298:     cur = obj
+  330:     for key in path:
+  324:         if not isinstance(cur, dict) or key not in cur:
+  292:             return None
+   32:         cur = cur[key]
+    6:     return cur
+       
+       
+    3: def describe_push(push, index):
+           """Summarise one dataLayer push, resolving its value and currency."""
+   24:     out = {"index": index, "event": None, "value": None, "value_state": "absent",
+   12:            "value_source": None, "currency": None, "products": [], "keys": [],
+   12:            "consent": None, "person_data_keys": [], "notes": []}
+   12:     if not isinstance(push, dict):
+               out["notes"].append(f"not an object: {str(push)[:80]}")
+               return out
+   50:     out["keys"] = [k for k in push if not k.startswith("gtm.")][:20]
+       
+           # gtag() calls land in the dataLayer as an arguments object with numeric
+           # keys, so `{"0":"config","1":"AW-..."}` is a real push and not junk.
+   12:     if "0" in push and isinstance(push.get("0"), str):
+    2:         cmd = push.get("0")
+    2:         out["event"] = f"gtag({cmd})"
+    2:         target = push.get("1")
+    2:         if isinstance(target, str):
+    2:             out["notes"].append(f"gtag command target: {target}")
+    2:         payload = push.get("2")
+    2:         if isinstance(payload, dict):
+    1:             push = {**payload, "event": out["event"]}
+       
+   12:     ev = push.get("event")
+   12:     if isinstance(ev, str):
+    7:         out["event"] = ev
+    5:     elif isinstance(push.get("value"), dict) and isinstance(push["value"].get("event"), str):
+               # Some wrappers nest the real push one level down under `value`.
+    2:         push = push["value"]
+    2:         out["event"] = push.get("event")
+       
+  153:     for label, path in VALUE_PATHS:
+  142:         found = _dig(push, path)
+  142:         if found is not None and not isinstance(found, (dict, list)):
+    1:             num, state = as_number(found)
+    1:             out.update({"value": num, "value_state": state, "value_source": label})
+    1:             break
+   64:     for path in CURRENCY_PATHS:
+   54:         cur = _dig(push, path)
+   54:         if isinstance(cur, str) and cur.strip():
+    2:             out["currency"] = cur.strip().upper()[:8]
+    2:             break
+  112:     for path in PRODUCT_PATHS:
+  101:         prods = _dig(push, path)
+  101:         if isinstance(prods, list) and prods:
+    2:             out["products"] = [p for p in prods if isinstance(p, dict)][:20]
+    1:             out["products_from"] = ".".join(path)
+    1:             break
+       
+   12:     blob = json.dumps(push, default=str)
+   12:     if re.search(r"(ad_storage|analytics_storage|consent_v2|consent_state|gtm\.init_consent)", blob):
+    1:         out["consent"] = _dig(push, ("marketing", "consent_v2")) or _dig(push, ("consent",)) \
+                   or _dig(push, ("consent_v2",)) or "referenced"
+   93:     for key in re.findall(r'"([A-Za-z0-9_]{2,40})"\s*:', blob):
+   81:         if PII_KEY_RE.search(key) and key not in out["person_data_keys"]:
+                   out["person_data_keys"].append(key)
+       
+           # A value with no currency is a real defect, not a parsing gap: platforms
+           # that receive it have to assume an account default.
+   12:     if out["value_state"] == "number" and not out["currency"]:
+               out["notes"].append("value present with no currency on this push")
+   12:     return out
+       
+       
+    3: def product_value(prod):
+           """Best numeric price on a product entry, GA4 or legacy field names."""
+    3:     for key in ("price", "item_price", "value", "amount"):
+    3:         if key in prod:
+    3:             num, state = as_number(prod[key])
+    3:             if state == "number":
+    3:                 return num, key
+           return None, None
+       
+       
+       # ---------------------------------------------------------------------------
+       # Assembly
+       # ---------------------------------------------------------------------------
+    3: def analyse(requests=None, pushes=None, notes=None):
+    3:     requests = requests or []
+    3:     pushes = pushes or []
+    3:     out = {
+    3:         "counts": {"requests_seen": len(requests), "datalayer_pushes": len(pushes)},
+    3:         "hits": [], "loaders": [], "unrecognised": [], "datalayer": [],
+    3:         "accounts": {}, "values": [], "consent": {}, "user_data": [],
+    3:         "notes": [], "warnings": [],
+           }
+           # A file that could not be read is a problem with the run, not a footnote,
+           # so it is promoted out of the notes and printed with the warnings.
+    6:     for n in (notes or []):
+    3:         (out["warnings"] if n.startswith("!!") else out["notes"]).append(n.lstrip("! "))
+       
+   32:     for obj in requests:
+   29:         kind, payload = decode_request(obj)
+   29:         if kind == "hit":
+   21:             out["hits"].append(payload)
+    8:         elif kind == "loader":
+    5:             out["loaders"].append(payload)
+               else:
+    3:             out["unrecognised"].append(payload)
+       
+           # Accounts seen, per vendor, from both events and loaders.
+    3:     acc = {}
+   24:     for h in out["hits"]:
+   21:         if h.get("account"):
+   20:             acc.setdefault(h["vendor"], set()).add(str(h["account"]))
+    8:     for l in out["loaders"]:
+    5:         if l.get("id"):
+    5:             acc.setdefault(l["what"], set()).add(str(l["id"]))
+   17:     out["accounts"] = {k: sorted(v) for k, v in sorted(acc.items())}
+       
+           # The money section: every real number observed, with what carried it.
+    3:     seen = set()
+   24:     for h in out["hits"]:
+   21:         if h["value_state"] != "number":
+   14:             continue
+               # The label belongs in the key: two conversion actions firing the same
+               # value is a real pattern (monday.com fires two labels at value=0), and
+               # collapsing them hides half their optimisation surface.
+   14:         key = (h["vendor"], h.get("event"), h["value"], h["currency"],
+    7:                h.get("conversion_label"), h.get("account"))
+    7:         if key in seen:
+    1:             continue
+    6:         seen.add(key)
+   12:         out["values"].append({
+    6:             "source": "network hit", "vendor": h["vendor"], "event": h.get("event"),
+    6:             "account": h.get("account"), "label": h.get("conversion_label"),
+    6:             "value": h["value"], "currency": h["currency"], "param": h["value_source"],
+               })
+       
+   15:     out["datalayer"] = [describe_push(p, i) for i, p in enumerate(pushes)]
+   15:     for d in out["datalayer"]:
+   12:         if d["value_state"] == "number":
+    1:             key = ("dataLayer", d["event"], d["value"], d["currency"])
+    1:             if key not in seen:
+    1:                 seen.add(key)
+    2:                 out["values"].append({
+    1:                     "source": "dataLayer", "vendor": "dataLayer", "event": d["event"],
+    1:                     "account": None, "label": None, "value": d["value"],
+    1:                     "currency": d["currency"], "param": d["value_source"],
+                       })
+   13:         for prod in d["products"]:
+    1:             num, field = product_value(prod)
+    1:             if num is None:
+                       continue
+    1:             key = ("product", d["event"], num, d["currency"], prod.get("id") or prod.get("item_id"))
+    1:             if key in seen:
+                       continue
+    1:             seen.add(key)
+    2:             out["values"].append({
+    1:                 "source": f"dataLayer product ({d.get('products_from', 'items')})",
+    1:                 "vendor": "dataLayer", "event": d["event"],
+    1:                 "account": prod.get("id") or prod.get("item_id"),
+    1:                 "label": (prod.get("name") or prod.get("item_name") or "")[:60] or None,
+    1:                 "value": num, "currency": d["currency"], "param": field,
+                   })
+   24:     for h in out["hits"]:
+   22:         for item in h.get("items", []):
+    1:             num, field = product_value(item)
+    1:             if num is None:
+                       continue
+    1:             key = ("hititem", h["vendor"], num, h["currency"], item.get("item_id"))
+    1:             if key in seen:
+                       continue
+    1:             seen.add(key)
+    2:             out["values"].append({
+    1:                 "source": f"{h['vendor']} item in hit", "vendor": h["vendor"],
+    1:                 "event": h.get("event"), "account": item.get("item_id"),
+    1:                 "label": (item.get("item_name") or "")[:60] or None,
+    1:                 "value": num, "currency": h["currency"], "param": field,
+                   })
+       
+           # Values the plumbing carries but did not fill in. Reported separately,
+           # because "they measure value but it arrives empty" is a finding about their
+           # setup and the opposite of "no value is tracked".
+    6:     out["empty_values"] = [
+   21:         {"vendor": h["vendor"], "event": h.get("event"), "param": h["value_source"],
+                "state": h["value_state"]}
+   27:         for h in out["hits"] if h["value_state"] in ("present-but-empty",
+                                                            "present-but-not-numeric")]
+       
+           # Consent picture across the capture.
+   27:     gcs_counts = Counter(h["consent"]["gcs"] for h in out["hits"] if h["consent"]["gcs"])
+    3:     out["consent"] = {
+    3:         "gcs_values_seen": dict(gcs_counts),
+    6:         "gcs_decoded": {g: decode_gcs(g) for g in gcs_counts},
+   48:         "consent_update_hits": sum(1 for h in out["hits"]
+   21:                                    if (h.get("event") or "") == "consent_update"),
+   45:         "npa_flag_seen": sorted({h["consent"]["npa"] for h in out["hits"]
+   21:                                  if h["consent"].get("npa") is not None}),
+   15:         "datalayer_consent_pushes": [d["index"] for d in out["datalayer"] if d["consent"]],
+           }
+    3:     if len(gcs_counts) > 1:
+    2:         out["warnings"].append(
+    1:             "more than one consent state (gcs) appears in this capture -- the hits "
+                   "sent before and after the consent update are not comparable; split them "
+                   "before concluding anything about what is consent-gated")
+       
+    3:     ud = Counter()
+   24:     for h in out["hits"]:
+   39:         for u in h["user_data"]:
+   18:             ud[u] += 1
+   13:     out["user_data"] = [{"signal": k, "hits": v} for k, v in ud.most_common()]
+       
+   15:     person_keys = sorted({k for d in out["datalayer"] for k in d["person_data_keys"]})
+    3:     if person_keys:
+               out["warnings"].append(
+                   "the dataLayer carries person-data keys (" + ", ".join(person_keys[:8]) +
+                   "). Their presence is the finding; the values are a visitor's personal "
+                   "data and are out of scope -- this parser never prints them.")
+       
+    3:     if not out["hits"] and requests:
+               out["warnings"].append(
+                   "no measurement hits decoded from " + str(len(requests)) + " request(s). "
+                   "Either nothing fired on this visit (consent, geo, or an ad-blocking "
+                   "profile), or the capture recorded only same-origin requests -- many "
+                   "capture tools do. Check the capture before reporting an empty stack.")
+    3:     if not requests and not pushes:
+               out["warnings"].append("nothing to parse: no requests and no dataLayer pushes found")
+    3:     return out
+       
+       
+       # ---------------------------------------------------------------------------
+       # Rendering
+       # ---------------------------------------------------------------------------
+    3: def _fmt_value(v, cur, state):
+   16:     if state == "number":
+    5:         return f"{v:g} {cur}" if cur else f"{v:g} (no currency)"
+   33:     return {"absent": "-", "present-but-empty": "EMPTY",
+   22:             "present-but-not-numeric": "NOT A NUMBER"}.get(state, state)
+       
+       
+    3: def render(s):
+    2:     L = []
+    2:     a = L.append
+    2:     c = s["counts"]
+    2:     a("# Runtime observation")
+    2:     a(f"{c['requests_seen']} captured requests · {c['datalayer_pushes']} dataLayer pushes")
+    4:     a(f"{len(s['hits'])} measurement hits decoded · {len(s['loaders'])} tag loaders · "
+    2:       f"{len(s['unrecognised'])} unrecognised\n")
+       
+    3:     for w in s["warnings"]:
+    1:         a(f"!! {w}\n")
+       
+           # The headline section: numbers, which is the whole reason to do this.
+    2:     a("## Conversion values actually observed")
+    2:     if s["values"]:
+    2:         a("   (a value here is what they computed for THIS pageview -- not their CAC,")
+    2:         a("    not their bid, not their margin)")
+    9:         for v in s["values"]:
+    7:             amount = f"{v['value']:g} {v['currency'] or '(currency missing)'}"
+    7:             label = f"  {v['label']}" if v.get("label") else ""
+    7:             acct = f"  {v['account']}" if v.get("account") else ""
+   14:             a(f"  {amount:>22}   {str(v['event'] or '?'):<22} {v['vendor']:<18} "
+    7:               f"[{v['param']}]{acct}{label}")
+           else:
+               a("  none. No hit or dataLayer push in this capture carried a numeric value.")
+               a("  That is a statement about THIS visit, not about their setup: value-bearing")
+               a("  events are usually add_to_cart, purchase, or a form thank-you page.")
+       
+    2:     if s.get("empty_values"):
+               a("\n## Values the plumbing carries but left empty")
+               a("   (the field is wired up and arriving blank -- a real setup defect,")
+               a("    and the opposite of 'they don't track value')")
+               for e in s["empty_values"]:
+                   a(f"  {e['vendor']:<20} {str(e['event'] or '?'):<22} {e['param']} -> {e['state']}")
+       
+    2:     a("\n## What fired")
+    2:     if not s["hits"]:
+    1:         a("  no network capture in this input" if not c["requests_seen"]
+                 else "  nothing in the capture matched a known measurement endpoint")
+    2:     grouped = OrderedDict()
+   19:     for h in s["hits"]:
+   34:         key = (h["vendor"], h.get("event"), h.get("account"),
+   17:                h.get("conversion_label"), h["value"], h["currency"], h["value_state"])
+   17:         grouped.setdefault(key, []).append(h)
+   17:     for (vendor, event, account, label, value, cur, state), hits in grouped.items():
+   15:         times = f" x{len(hits)}" if len(hits) > 1 else ""
+   15:         a(f"\n  {vendor}  {event or '(no event name)'}{times}")
+   30:         a(f"      account: {account or 'not in hit'}"
+   15:           + (f"   label: {label}" if label else ""))
+   30:         a(f"      value:   {_fmt_value(value, cur, state)}"
+   15:           + (f"   [from {hits[0]['value_source']}]" if hits[0]["value_source"] else ""))
+   15:         h = hits[0]
+   15:         if h.get("conversion_kind"):
+    4:             a(f"      kind:    {h['conversion_kind']}")
+   15:         if h.get("event_params"):
+    5:             shown = list(h["event_params"].items())[:8]
+   24:             a("      params:  " + ", ".join(f"{k}={str(v)[:40]}" for k, v in shown))
+   15:         if h.get("items"):
+    1:             a(f"      items:   {len(h['items'])}")
+    2:             for item in h["items"][:4]:
+    8:                 a("        " + ", ".join(f"{k}={str(v)[:44]}" for k, v in list(item.items())[:6]))
+   15:         if h["consent"]["gcs"]:
+    8:             dec = h["consent"]["gcs_decoded"]
+   16:             detail = (f"  (ad_storage {dec['ad_storage']}, analytics_storage "
+   16:                       f"{dec['analytics_storage']})") if dec else ""
+    8:             a(f"      consent: gcs={h['consent']['gcs']}{detail}")
+   15:         if h["user_data"]:
+    8:             a(f"      identity: {', '.join(h['user_data'][:4])}")
+   15:         if h["endpoint"]:
+   15:             a(f"      endpoint: {h['endpoint']}")
+   22:         for n in h["notes"][:3]:
+    7:             a(f"      note:    {n}")
+   15:         if h.get("decoded_extras"):
+                   blob = json.dumps(h["decoded_extras"], default=str)
+                   a(f"      decoded: {blob[:300]}{'...' if len(blob) > 300 else ''}")
+       
+    2:     if s["accounts"]:
+    1:         a("\n## Accounts and IDs reached on this visit")
+   11:         for k, v in s["accounts"].items():
+   10:             a(f"  {k}: {', '.join(v)}")
+       
+    2:     if s["consent"]["gcs_values_seen"]:
+    1:         a("\n## Consent state during the capture")
+    3:         for g, n in s["consent"]["gcs_values_seen"].items():
+    2:             dec = s["consent"]["gcs_decoded"].get(g)
+    4:             detail = (f"ad_storage {dec['ad_storage']}, analytics_storage "
+    4:                       f"{dec['analytics_storage']}") if dec else "shape not recognised"
+    2:             a(f"  gcs={g}  ({detail})  on {n} hit(s)")
+    1:         if s["consent"]["consent_update_hits"]:
+    1:             a(f"  consent_update hits: {s['consent']['consent_update_hits']} "
+                     f"-- consent changed mid-capture")
+    1:         if s["consent"]["npa_flag_seen"]:
+    2:             a(f"  npa (non-personalised ads) values seen: "
+    1:               f"{', '.join(s['consent']['npa_flag_seen'])}")
+    1:         a("  gcd (consent default string) is reported raw in --json; its encoding is")
+    1:         a("  undocumented and changes, so it is not decoded here.")
+       
+    2:     if s["user_data"]:
+    1:         a("\n## Identity and matching signals")
+    1:         a("   (presence only -- the values are a visitor's data and are not printed)")
+    8:         for u in s["user_data"]:
+    7:             a(f"  {u['hits']:>3} hit(s)  {u['signal']}")
+       
+    2:     if s["datalayer"]:
+    1:         a(f"\n## dataLayer ({len(s['datalayer'])} pushes, in order)")
+   13:         for d in s["datalayer"]:
+   12:             if not (d["event"] or d["value_state"] != "absent" or d["products"]
+    2:                     or d["consent"]):
+    1:                 continue
+   12:             val = (f"   value={_fmt_value(d['value'], d['currency'], d['value_state'])}"
+   12:                    f" [{d['value_source']}]" if d["value_state"] != "absent" else "")
+   11:             a(f"  [{d['index']:>3}] {d['event'] or '(no event key)'}{val}")
+   11:             if d["consent"]:
+    1:                 a(f"        consent: {json.dumps(d['consent'], default=str)[:160]}")
+   12:             for prod in d["products"][:4]:
+    1:                 num, field = product_value(prod)
+    1:                 name = prod.get("name") or prod.get("item_name") or prod.get("id") or "?"
+    2:                 a(f"        product: {str(name)[:52]:<52} "
+    1:                   f"{(str(num) + ' (' + str(field) + ')') if num is not None else 'no price'}")
+   11:             if len(d["products"]) > 4:
+                       a(f"        ... {len(d['products']) - 4} more products (use --json)")
+   13:             for n in d["notes"][:2]:
+    2:                 a(f"        note: {n}")
+   11:             if d["person_data_keys"]:
+                       a(f"        person-data keys present (values withheld): "
+                         f"{', '.join(d['person_data_keys'][:6])}")
+       
+    2:     if s["loaders"]:
+    1:         a("\n## Tag libraries loaded (these prove presence, not that anything fired)")
+    5:         for l in s["loaders"]:
+    4:             a(f"  {l['what']}{'  ' + l['id'] if l.get('id') else ''}")
+       
+    2:     if s["unrecognised"]:
+    1:         a(f"\n## Not recognised as measurement endpoints ({len(s['unrecognised'])})")
+    1:         a("   (listed so a vendor this parser does not know does not vanish silently)")
+    4:         for u in s["unrecognised"][:20]:
+    3:             a(f"  {u.get('entry', '')[:150]}")
+    1:         if len(s["unrecognised"]) > 20:
+                   a(f"  ... {len(s['unrecognised']) - 20} more (use --json)")
+       
+    2:     if s["notes"]:
+    2:         a("\n## Capture notes")
+    4:         for n in s["notes"]:
+    2:             a(f"  - {n}")
+       
+    2:     a("\n## What this capture does and does not show")
+    2:     a("  Shows: that these endpoints received these events, with these values, on one")
+    2:     a("         visit from this browser, geo and consent state.")
+    2:     a("  Does not show: what fires for other visitors, in other markets, or after a")
+    2:     a("         conversion you did not perform (and must not); whether the receiving ad")
+    2:     a("         account still spends; or anything about budget, bids or performance.")
+    2:     return "\n".join(L)
+       
+       
+    3: def main():
+           # An explicit --help is a request that succeeded, so it exits 0. Running with
+           # no arguments at all is a usage error and still exits 1.
+    3:     if "--help" in sys.argv or "-h" in sys.argv:
+               print(__doc__)
+               return 0
+    3:     argv = sys.argv[1:]
+    3:     if not argv or "--help" in argv or "-h" in argv:
+               print(__doc__)
+               return 1
+    3:     files, dl_files = [], []
+    3:     i = 0
+    7:     while i < len(argv):
+    4:         arg = argv[i]
+    4:         if arg in ("--datalayer", "--dl"):
+                   if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                       dl_files.append(argv[i + 1])
+                       i += 1
+                   else:
+                       print(f"{arg} needs a file path", file=sys.stderr)
+                       return 2
+    4:         elif not arg.startswith("--"):
+    3:             files.append(arg)
+    4:         i += 1
+       
+    3:     requests, pushes, notes = [], [], []
+    6:     for path in files:
+    3:         r, p, n = load_capture(path)
+    3:         requests += r
+    3:         pushes += p
+    3:         notes += n
+    3:         notes.append(f"{path}: {len(r)} request(s), {len(p)} dataLayer push(es)")
+    3:     for path in dl_files:
+               r, p, n = load_capture(path)
+               # An explicit --datalayer file is a dataLayer file even if the sniffing
+               # heuristic disagreed about some of its entries.
+               pushes += p + [x for x in r if isinstance(x, dict)]
+               notes += n
+               notes.append(f"{path} (as dataLayer): {len(p) + len(r)} push(es)")
+       
+    3:     try:
+    3:         s = analyse(requests, pushes, notes)
+           except Exception as e:
+               print(f"could not analyse capture: {e}", file=sys.stderr)
+               return 2
+    3:     print(json.dumps(s, indent=2, default=str) if "--json" in argv else render(s))
+    3:     return 0
+       
+       
+    3: if __name__ == "__main__":
+    3:     sys.exit(main())

@@ -1,0 +1,1060 @@
+       #!/usr/bin/env python3
+    2: """Collect every public growth/martech signal a URL serves to an ordinary visitor.
+       
+       This only requests things the site hands to any browser that loads it: the HTML,
+       its response headers, the scripts it references, and the well-known paths that
+       exist to be read (robots.txt, sitemap.xml, ads.txt, security.txt). Nothing is
+       guessed at, brute-forced, or fetched from behind a login.
+       
+       Usage:
+           python3 recon.py https://example.com                   # collect + print
+           python3 recon.py https://example.com --json out.json    # also save raw facts
+           python3 recon.py https://example.com --pages /pricing,/demo
+           python3 recon.py https://example.com --no-containers    # skip gtm.js parsing
+       
+       Output is deliberately raw. Reading it and deciding what it means is the analyst's
+       job, and the SKILL.md workflow covers how to turn this into a report.
+       """
+       
+    2: import json
+    2: import os
+    2: import re
+    2: import sys
+    2: import gzip
+    2: import zlib
+    2: import socket
+    2: import ssl
+    2: import subprocess
+    2: import urllib.parse
+    2: import urllib.request
+    2: import urllib.error
+    2: from collections import OrderedDict
+    2: from concurrent.futures import ThreadPoolExecutor
+       
+    2: sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    2: from gtm_parse import analyse as analyse_container, fetch as _fetch_text, UA  # noqa: E402
+       
+    2: TIMEOUT = 25
+       
+       # ---------------------------------------------------------------------------
+       # Vendor fingerprints. Each entry: (label, regex, what the hit implies).
+       # Regexes run against the raw HTML. The "implies" text exists so the report can
+       # say why a detection matters instead of listing vendor names.
+       # references/vendor-fingerprints.md has the longer catalogue and reasoning.
+       # ---------------------------------------------------------------------------
+  234: FINGERPRINTS = [
+           # --- identity of the measurement setup --------------------------------
+    2:     ("GTM container", r"GTM-[A-Z0-9]{4,10}", "tag manager container; fetchable in full", 0),
+    2:     ("GA4 measurement ID", r"G-[A-Z0-9]{8,12}", "GA4 property", 0),
+    2:     ("Google Tag ID", r"GT-[A-Z0-9]{6,12}", "newer Google tag wrapper", 0),
+    2:     ("Google Ads", r"AW-\d{6,12}", "Google Ads conversion account", 0),
+    2:     ("Floodlight", r"DC-\d{6,12}", "DV360/CM360 — programmatic display spend", 0),
+    2:     ("Universal Analytics", r"UA-\d{4,10}-\d+", "legacy GA; stale tracking left in place", 0),
+    2:     ("Google Optimize (dead)", r"OPT-[A-Z0-9]{6,10}", "legacy -- Google sunset Optimize in Sept 2023, so this is container debt, NOT a live testing tool", 0),
+           # --- paid social / demand ---------------------------------------------
+    2:     ("Meta Pixel", r"fbq\(\s*['\"]init['\"]\s*,\s*['\"](\d{13,17})|connect\.facebook\.net", "Meta ads"),
+    2:     ("LinkedIn Insight", r"_linkedin_partner_id\s*=\s*[\"']?(\d+)|snap\.licdn\.com|px\.ads\.linkedin\.com|sjs\.bizographics\.com", "LinkedIn ads — B2B demand gen"),
+    2:     ("TikTok Pixel", r"ttq\.load\(\s*['\"]([A-Z0-9]+)|analytics\.tiktok\.com", "TikTok ads"),
+    2:     ("Reddit Pixel", r"rdt\(\s*['\"]init['\"]\s*,\s*['\"]([a-z0-9_]+)|events\.redditmedia\.com|alb\.reddit\.com", "Reddit ads"),
+    2:     ("X/Twitter Pixel", r"twq\(\s*['\"](?:init|config)['\"]\s*,\s*['\"]([a-z0-9]+)|static\.ads-twitter\.com|analytics\.twitter\.com", "X ads"),
+    2:     ("Pinterest Tag", r"pintrk\(\s*['\"]load['\"]\s*,\s*['\"](\d+)|ct\.pinterest\.com|s\.pinimg\.com", "Pinterest ads"),
+    2:     ("Quora Pixel", r"qp\(\s*['\"]init['\"]\s*,\s*['\"]([a-f0-9]+)|a\.quora\.com", "Quora ads"),
+    2:     ("Bing/Microsoft UET", r"\"ti\"\s*:\s*\"(\d{6,12})\"|bat\.bing\.com", "Microsoft Ads"),
+    2:     ("Criteo", r"criteo\.(?:net|com)", "retargeting"),
+    2:     ("Taboola", r"_taboola|trc\.taboola\.com", "native/content ads"),
+    2:     ("Outbrain", r"outbrain\.com/outbrain\.js|obApi", "native/content ads"),
+           # --- ABM / visitor de-anonymisation (reveals outbound + ABM strategy) --
+    2:     ("6sense", r"6si\.com|_6si|6sense", "intent data + ABM; enterprise-motion signal"),
+    2:     ("Demandbase", r"demandbase|company-target\.com", "ABM platform"),
+    2:     ("RB2B", r"rb2b|reb2b", "person-level visitor ID; aggressive outbound motion"),
+    2:     ("Clearbit/HubSpot Breeze", r"clearbit|reveal\.clearbit\.com", "firmographic enrichment + form shortening"),
+    2:     ("Koala", r"getkoala\.com|ko_track", "product+web intent scoring for sales"),
+    2:     ("Warmly", r"warmly\.ai|getwarmly", "visitor de-anonymisation + chat"),
+    2:     ("Vector", r"vector\.co/|vectorjs", "visitor intent"),
+    2:     ("Apollo tracker", r"apollo\.io/.*tracker|assets\.apollo\.io", "outbound prospecting"),
+    2:     ("Leadfeeder/Dealfront", r"leadfeeder|dealfront", "company-level visitor ID"),
+    2:     ("Albacross", r"albacross", "company-level visitor ID"),
+    2:     ("Factors.ai", r"factors\.ai", "attribution + ABM"),
+    2:     ("Influ2", r"influ2", "person-based advertising"),
+           # --- MAP / CRM / lifecycle --------------------------------------------
+    2:     ("HubSpot", r"js\.hs-scripts\.com/(\d+)|hs-analytics|hubspot\.com/.*portalId", "HubSpot hub"),
+    2:     ("Marketo", r"munchkin[^0-9]{0,20}(\d{3}-[A-Z0-9]{3}-\d{3})|munchkin\.marketo\.net", "Marketo MAP — enterprise MQL motion", 0),
+    2:     ("Pardot", r"piAId\s*=\s*['\"]?(\d+)|pi\.pardot\.com", "Pardot/Account Engagement"),
+    2:     ("Eloqua", r"eloqua|elqCfg", "Oracle Eloqua MAP"),
+    2:     ("Salesforce Web-to-Lead", r"webto\.salesforce\.com", "direct-to-SFDC lead capture"),
+    2:     ("Braze", r"braze\.com|appboy", "lifecycle messaging"),
+    2:     ("Customer.io", r"customer\.io|cioJs", "lifecycle messaging"),
+    2:     ("Klaviyo", r"klaviyo\.com|_learnq", "ecommerce lifecycle"),
+    2:     ("Iterable", r"iterable\.com", "lifecycle messaging"),
+           # --- product analytics / CDP ------------------------------------------
+    2:     ("Segment", r"cdn\.segment\.com/analytics\.js/v1/([A-Za-z0-9]+)|analytics\.load\(\s*['\"]([A-Za-z0-9]{10,})", "CDP — events fan out server-side"),
+    2:     ("RudderStack", r"rudderlabs|rudderstack", "open-source CDP"),
+    2:     ("Amplitude", r"amplitude\.com|amplitude\.getInstance", "product analytics"),
+    2:     ("Mixpanel", r"mixpanel\.(?:com|init\(\s*['\"]([a-f0-9]{32}))", "product analytics"),
+    2:     ("PostHog", r"posthog\.com|phc_[A-Za-z0-9]{20,}", "product analytics"),
+    2:     ("Heap", r"heapanalytics\.com|heap\.load\(\s*['\"]?(\d+)", "autocapture analytics"),
+    2:     ("Pendo", r"pendo\.io", "in-product guides + analytics"),
+    2:     ("June", r"june\.so", "product analytics"),
+           # --- session replay / UX ----------------------------------------------
+    2:     ("Hotjar", r"hotjar\.com|hjid\s*:\s*(\d+)", "session replay + surveys"),
+    2:     ("Microsoft Clarity", r"clarity\.ms", "free session replay"),
+    2:     ("FullStory", r"fullstory\.com|FS\.identify", "session replay"),
+    2:     ("LogRocket", r"logrocket", "session replay"),
+    2:     ("Contentsquare", r"contentsquare|quantummetric", "enterprise experience analytics"),
+    2:     ("Mouseflow", r"mouseflow", "session replay"),
+    2:     ("Smartlook", r"smartlook", "session replay"),
+           # --- experimentation (reveals their testing velocity) ------------------
+    2:     ("Optimizely", r"cdn\.optimizely\.com/(?:js|public|datafiles)/([A-Za-z0-9_-]+)", "A/B testing; datafile may be public"),
+    2:     ("VWO", r"visualwebsiteoptimizer\.com|_vwo_code|vwo_\$", "A/B testing"),
+    2:     ("LaunchDarkly", r"launchdarkly\.com|ldclient", "feature flags"),
+    2:     ("Statsig", r"statsig\.com|statsigsdk", "experimentation + flags"),
+    2:     ("Split.io", r"split\.io|splitio", "feature flags"),
+    2:     ("GrowthBook", r"growthbook", "open-source experimentation"),
+    2:     ("Eppo", r"eppo\.cloud|geteppo", "warehouse-native experimentation"),
+    2:     ("AB Tasty", r"abtasty", "A/B testing + personalisation"),
+    2:     ("Kameleoon", r"kameleoon", "A/B testing"),
+    2:     ("Convert.com", r"cdn-?\d*\.convertexperiments\.com", "A/B testing"),
+    2:     ("Mutiny", r"mutinyhq|mutiny\.sh", "landing-page personalisation for ABM"),
+    2:     ("Intellimize", r"intellimize", "landing-page personalisation"),
+    2:     ("Dynamic Yield", r"dynamicyield", "personalisation"),
+    2:     ("Unbounce", r"unbounce", "standalone landing pages — paid-traffic motion"),
+    2:     ("Instapage", r"instapage", "standalone landing pages"),
+           # --- chat / scheduling (speed-to-lead motion) --------------------------
+    2:     ("Qualified", r"qualified\.com|qualifiedjs", "sales chat routing on high-intent pages"),
+    2:     ("Drift", r"drift\.com|drift\.load", "conversational marketing"),
+    2:     ("Intercom", r"intercom\.(?:io|com)|intercomSettings", "support/chat"),
+    2:     ("Chili Piper", r"chilipiper", "instant inbound meeting booking"),
+    2:     ("Calendly", r"calendly\.com", "self-serve booking"),
+    2:     ("Default", r"default\.com/|usedefault", "inbound routing"),
+    2:     ("Crisp/Tidio/Zendesk chat", r"crisp\.chat|tidio|zdassets", "chat"),
+           # --- consent (gates everything above; shapes their data quality) -------
+    2:     ("OneTrust", r"onetrust|cdn\.cookielaw\.org|data-domain-script", "enterprise CMP"),
+    2:     ("Cookiebot", r"cookiebot|consent\.cookiebot\.com", "CMP"),
+    2:     ("Usercentrics", r"usercentrics", "CMP"),
+    2:     ("Didomi", r"didomi", "CMP"),
+    2:     ("Osano", r"osano", "CMP"),
+    2:     ("Ketch", r"ketch\.com|ketchcdn", "CMP"),
+    2:     ("TrustArc", r"trustarc", "CMP"),
+    2:     ("Iubenda", r"iubenda", "CMP"),
+    2:     ("Termly", r"termly", "CMP"),
+           # --- platform / infra --------------------------------------------------
+    2:     ("Next.js", r"/_next/static|__NEXT_DATA__", "Next.js — __NEXT_DATA__ may expose props", 0),
+    2:     ("Nuxt", r"__NUXT__|/_nuxt/", "Nuxt", 0),
+    2:     ("Gatsby", r"gatsby-|___gatsby", "Gatsby"),
+    2:     ("Astro", r"astro-island|/_astro/", "Astro"),
+    2:     ("Webflow", r"webflow\.(?:com|io)|wf-", "Webflow — marketing site, fast iteration"),
+    2:     ("WordPress", r"/wp-content/|/wp-includes/", "WordPress"),
+    2:     ("HubSpot CMS", r"hs-sites\.com|hubspotusercontent", "HubSpot CMS"),
+    2:     ("Shopify", r"cdn\.shopify\.com|Shopify\.theme", "Shopify storefront"),
+    2:     ("Contentful", r"contentful\.com|ctfassets\.net", "headless CMS"),
+    2:     ("Sanity", r"sanity\.io|cdn\.sanity", "headless CMS"),
+    2:     ("Storyblok", r"storyblok", "headless CMS"),
+    2:     ("Stripe", r"js\.stripe\.com|pk_live_[A-Za-z0-9]{20,}", "self-serve checkout"),
+    2:     ("Paddle", r"paddle\.com|paddle_button", "merchant of record — global self-serve"),
+    2:     ("Chargebee", r"chargebee", "subscription billing"),
+           # --- social proof ------------------------------------------------------
+    2:     ("G2", r"g2crowd|g2\.com/products", "G2 review widget"),
+    2:     ("Trustpilot", r"trustpilot", "Trustpilot widget"),
+           # --- additions commonly only visible via CSP / container -------------
+    2:     ("ZoomInfo", r"js\.zi-scripts\.com|zoominfo", "firmographic enrichment + form shortening"),
+    2:     ("Capterra", r"ct\.capterra\.com|tr\.capterra\.com", "review-site paid listings"),
+    2:     ("Recurly", r"js\.recurly\.com|recurly", "subscription billing"),
+    2:     ("Datadog RUM", r"datadoghq-browser-agent|logs\.datadoghq\.com", "real-user monitoring"),
+    2:     ("Wistia", r"wistia\.(?:com|net)", "video hosting with lead capture"),
+    2:     ("Vidyard", r"vidyard", "video hosting with lead capture"),
+    2:     ("Amazon Ads", r"amazon-adsystem\.com", "Amazon DSP"),
+    2:     ("Xing", r"static\.xingcdn\.com|xing\.com", "DACH professional network ads"),
+    2:     ("Yahoo Japan", r"s\.yjtag\.jp|yahoo\.co\.jp", "Japan market ads"),
+    2:     ("TVSquared", r"tvsquared", "TV attribution — offline/brand spend"),
+    2:     ("Greenhouse", r"boards\.greenhouse\.io|job-boards\.greenhouse\.io", "ATS — headcount plans readable"),
+    2:     ("Lever", r"jobs\.lever\.co", "ATS — headcount plans readable"),
+    2:     ("Ashby", r"jobs\.ashbyhq\.com", "ATS — headcount plans readable"),
+    2:     ("Spara", r"spara\.co", "AI SDR / inbound agent"),
+    2:     ("Jotform", r"jotform|jotfor\.ms", "form tooling outside the main stack"),
+       ]
+       
+    2: WELL_KNOWN = [
+           "/robots.txt", "/sitemap.xml", "/sitemap_index.xml", "/ads.txt", "/app-ads.txt",
+           "/.well-known/security.txt", "/security.txt", "/humans.txt",
+           "/.well-known/apple-app-site-association", "/.well-known/assetlinks.json",
+           "/llms.txt", "/feed", "/rss.xml", "/blog/rss.xml", "/changelog",
+       ]
+       
+       
+    2: def norm_url(u):
+    2:     if not re.match(r"^https?://", u):
+               u = "https://" + u
+    2:     return u
+       
+       
+    2: def fetch_full(url, timeout=TIMEOUT):
+           """Fetch returning body + headers + final URL. Falls back to curl."""
+   74:     req = urllib.request.Request(url, headers={
+   37:         "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+   37:         "Accept-Encoding": "gzip, deflate", "Accept-Language": "en-US,en;q=0.9",
+           })
+   37:     try:
+   37:         ctx = ssl.create_default_context()
+   37:         try:
+   37:             import certifi
+   37:             ctx = ssl.create_default_context(cafile=certifi.where())
+               except Exception:
+                   pass
+   53:         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+   16:             raw = r.read()
+   16:             enc = (r.headers.get("Content-Encoding") or "").lower()
+   16:             if "gzip" in enc:
+   16:                 raw = gzip.decompress(raw)
+                   elif "deflate" in enc:
+                       try:
+                           raw = zlib.decompress(raw)
+                       except zlib.error:
+                           raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+   32:             return {"url": r.url, "status": r.status, "body": raw.decode("utf-8", "replace"),
+   16:                     "headers": dict(r.headers.items())}
+   21:     except urllib.error.HTTPError as e:
+   21:         return {"url": url, "status": e.code, "body": "", "headers": dict(e.headers.items()) if e.headers else {}}
+           except Exception:
+               return _curl_full(url, timeout)
+       
+       
+    2: def _curl_full(url, timeout):
+           try:
+               p = subprocess.run(
+                   ["curl", "-sSL", "--compressed", "-D", "-", "--max-time", str(timeout),
+                    "-A", UA, "-w", "\n__FINAL__%{url_effective}\n__STATUS__%{http_code}", url],
+                   capture_output=True, text=True, timeout=timeout + 15)
+               out = p.stdout
+               final = re.search(r"\n__FINAL__(.*)", out)
+               status = re.search(r"\n__STATUS__(\d+)", out)
+               out = re.sub(r"\n__FINAL__.*", "", out, flags=re.S)
+               # Last header block then body
+               parts = re.split(r"\r?\n\r?\n", out, maxsplit=0)
+               headers = {}
+               body = out
+               for i, blk in enumerate(parts):
+                   if blk.startswith("HTTP/"):
+                       headers = {}
+                       for line in blk.splitlines()[1:]:
+                           if ":" in line:
+                               k, _, v = line.partition(":")
+                               headers[k.strip()] = v.strip()
+                       body = "\n\n".join(parts[i + 1:])
+               return {"url": final.group(1).strip() if final else url,
+                       "status": int(status.group(1)) if status else 0,
+                       "body": body, "headers": headers}
+           except Exception as e:
+               return {"url": url, "status": 0, "body": "", "headers": {}, "error": str(e)[:200]}
+       
+       
+       # A dotted i18n key like "templateCenter.integration.clearbit.description" looks
+       # exactly like a hostname unless the suffix is checked against real TLDs, which
+       # is how an integrations catalogue produced confident vendor detections.
+    2: TLD_RE = (r"\.(?:com|net|org|io|ai|co|dev|app|eu|jp|me|tv|cloud|gg|sh|xyz|us|uk|de|fr|"
+                 r"br|mx|ca|au|in|cn|so|to|id|fm|live|site|online|tech|link|page|run|work|biz|"
+                 r"info|cc|ly|es|it|nl|se|no|fi|dk|pl|ru|kr|tw|hk|sg|za|ie|at|ch|be|pt|gr|cz|"
+                 r"com\.br|co\.uk|co\.jp|com\.au|com\.mx|co\.za)(?:[/:?\s\"\'<>]|$)")
+       
+       
+    2: def _evidence_strength(matches, contexts=()):
+           """Decide whether a detection is load evidence or just a name in the text.
+       
+           A bare product name matches anywhere it is mentioned -- including a target's
+           own integrations directory or a competitor list -- so monday.com's i18n
+           strings produced confident "Clearbit" and "Jotform" detections for vendors
+           that load nothing. Treat a host, an ID shape or a JS global as strong, and a
+           bare alphabetic name as weak.
+           """
+    1:     for m in matches:
+    1:         if re.search(r"[a-z0-9-]+\.[a-z]{2,}(/|$)", m, re.I):      # a host
+    1:             return "strong"
+               if re.search(r"[A-Z]{2}-[A-Z0-9]{4,}|\d{6,}|_[a-z]+_|^phc_|^pk_live_", m):  # an ID
+                   return "strong"
+               if re.search(r"(fbq|ttq|twq|pintrk|rdt|qp|_linkedin|munchkin|piAId|obApi|Settings|load\()", m):
+                   return "strong"
+               # An asset path or injected global is served by the thing itself, so it
+               # is load evidence even though it contains no host and no ID.
+               if re.search(r"(^/|/_)(_?next|_?nuxt|astro|wp-content|wp-includes|gatsby)", m, re.I):
+                   return "strong"
+               if re.search(r"(__NEXT_DATA__|__NUXT__|___gatsby|astro-island|_vwo_|_learnq|"
+                            r"intercomSettings|elqCfg|Shopify\.theme|data-domain-script|hjid|"
+                            r"_vis_opt|phc_|pk_live_)", m):
+                   return "strong"
+       
+           # A pattern can match only the bare vendor name inside what is actually a
+           # hostname -- "contentsquare" out of "app.contentsquare.com", which came from
+           # a CSP allowlist and is unambiguous load evidence. So check whether the match
+           # sits inside a host or URL before calling it a mere mention. An i18n string
+           # in an integrations catalogue has no TLD next to it and stays weak.
+           for m in matches:
+               token = re.escape(m.strip().strip("./"))
+               if not token or len(token) < 3:
+                   continue
+               for ctx in contexts:
+                   if re.search(r"[a-z0-9-]*" + token + r"[a-z0-9-]*" + TLD_RE, ctx, re.I):
+                       return "strong"
+                   if re.search(r"//[^\s\"\'<>]*" + token, ctx, re.I):
+                       return "strong"
+           return "weak"
+       
+       
+    2: def fingerprint(html, source="html"):
+           """Run the fingerprint catalogue over a blob of text.
+       
+           Entries carry explicit regex flags because the ID patterns (GTM-, G-, AW-)
+           must stay case-sensitive -- lowercased near-misses like a `g-disabled` CSS
+           class or a `gtm-tracking` data attribute otherwise masquerade as real IDs.
+           """
+    2:     hits = OrderedDict()
+  234:     for entry in FINGERPRINTS:
+  232:         label, pat, implies = entry[0], entry[1], entry[2]
+  232:         flags = entry[3] if len(entry) > 3 else re.I
+  232:         ms = list(re.finditer(pat, html, flags))
+  232:         if not ms:
+  231:             continue
+    1:         ids = []
+   21:         for m in ms[:20]:
+   20:             got = next((g for g in m.groups() if g), None) if m.groups() else m.group(0)
+   20:             if got:
+   20:                 ids.append(got)
+   21:         matched = [m.group(0) for m in ms[:20]]
+   21:         windows = [html[max(0, m.start() - 60):m.end() + 60] for m in ms[:20]]
+    2:         hits[label] = {"implies": implies, "occurrences": len(ms),
+    1:                        "ids": sorted(set(ids))[:10], "source": source,
+    1:                        "evidence": _evidence_strength(matched + ids, windows)}
+    2:     return hits
+       
+       
+    2: def third_party_hosts(html, own_host):
+    2:     hosts = {}
+  272:     for m in re.finditer(r"""(?:src|href)\s*=\s*["']((?:https?:)?//[^"'>\s]+)""", html, re.I):
+  270:         u = m.group(1)
+  270:         if u.startswith("//"):
+                   u = "https:" + u
+  270:         h = urllib.parse.urlparse(u).netloc.lower()
+  270:         base = own_host.replace("www.", "")
+  270:         if h and base not in h:
+   31:             hosts[h] = hosts.get(h, 0) + 1
+   52:     return [{"host": h, "refs": n} for h, n in sorted(hosts.items(), key=lambda x: -x[1])]
+       
+       
+    2: def advertiser_identity(html, host, containers):
+           """Work out who this company is *as an advertiser*, so their public ad
+           libraries can be opened.
+       
+           The ad libraries are the only public source that shows what a competitor is
+           actually running right now — the creative, the headline, the call to action
+           and the date it started. A tag container shows the plumbing; the ad library
+           shows the campaign. They answer different questions and the second one is
+           usually the one people came for.
+       
+           Scoping matters: a keyword search on a brand name returns other advertisers'
+           ads that merely mention it. Google's centre scopes by domain, which is exact.
+           Meta scopes properly only by numeric Page ID, which many sites publish in an
+           `fb:pages` meta tag.
+           """
+    2:     base = host.lower().replace("www.", "")
+           # Take the registrable label, not the first one: "news.ycombinator.com" is
+           # ycombinator, not news. Two-part public suffixes get one extra hop back.
+    6:     labels = [l for l in base.split(".") if l]
+    2:     two_part = {"co", "com", "org", "net", "gov", "edu", "ac"}
+    2:     if len(labels) >= 3 and labels[-2] in two_part:
+               brand = labels[-3]
+    2:     elif len(labels) >= 2:
+    2:         brand = labels[-2]
+           else:
+               brand = labels[0] if labels else base
+       
+    2:     ident = {"domain": base, "brand": brand, "facebook_page_ids": [], "facebook_slugs": []}
+       
+           # fb:pages is the exact numeric Page ID, when a site publishes it.
+    3:     for m in re.finditer(r'<meta[^>]+property=["\']fb:pages["\'][^>]+content=["\']([^"\']+)', html, re.I):
+    2:         ident["facebook_page_ids"] += [x.strip() for x in m.group(1).split(",") if x.strip().isdigit()]
+       
+           # Otherwise the social link gives a slug, which a human can resolve in one click.
+    6:     for m in re.finditer(r'facebook\.com/([A-Za-z0-9._%-]{2,50})', html, re.I):
+    4:         slug = m.group(1)
+    4:         if slug.lower() not in ("sharer", "dialog", "plugins", "tr", "groups", "profile.php",
+                                       "pages", "events", "watch", "login", "help"):
+    4:             ident["facebook_slugs"].append(slug)
+    2:     ident["facebook_slugs"] = sorted(set(ident["facebook_slugs"]))[:5]
+    2:     ident["facebook_page_ids"] = sorted(set(ident["facebook_page_ids"]))[:5]
+       
+           # Ad account IDs already recovered from the containers.
+    2:     aw, meta_pixels = set(), set()
+    2:     for c in containers.values():
+               if not isinstance(c, dict):
+                   continue
+               aw |= set((c.get("google_ads_summary") or {}).get("ads_accounts") or [])
+               meta_pixels |= set((c.get("vendor_account_ids") or {}).get("meta_pixel") or [])
+    2:     ident["google_ads_accounts"] = sorted(aw)
+    2:     ident["meta_pixel_ids"] = sorted(meta_pixels)
+    2:     return ident
+       
+       
+    2: def ad_library_links(ident):
+           """Build ready-to-open ad library URLs.
+       
+           `status` is honest about what each one costs: "open" works unauthenticated,
+           "sign-in" will hit a login wall, "manual" needs one human step to scope it.
+           """
+    2:     q = urllib.parse.quote_plus
+    2:     base, brand = ident["domain"], ident["brand"]
+    2:     out = {}
+       
+    2:     out["google_ads_transparency"] = {
+    2:         "url": f"https://adstransparency.google.com/?region=anywhere&domain={q(base)}",
+    2:         "status": "open",
+    2:         "shows": "every verified advertiser account running ads to this domain, with creatives, "
+                        "formats, platforms and date ranges",
+           }
+       
+    2:     if ident["facebook_page_ids"]:
+    1:         pid = ident["facebook_page_ids"][0]
+    1:         out["meta_ad_library"] = {
+    2:             "url": ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+    1:                     f"&country=ALL&media_type=all&view_all_page_id={pid}"),
+    1:             "status": "open",
+    1:             "shows": "their active ads only, with creative, primary text, call to action, "
+                            "start date and Library ID",
+    1:             "scoped_by": f"facebook page id {pid} (from the fb:pages meta tag)",
+               }
+           else:
+    1:         out["meta_ad_library"] = {
+    2:             "url": ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+    1:                     f"&country=ALL&media_type=all&q={q(brand)}"),
+    1:             "status": "manual",
+    1:             "shows": "a keyword search, which also returns unrelated advertisers",
+    1:             "scoped_by": "nothing yet — no fb:pages meta tag was published",
+    2:             "next_step": ("open it, type the brand into the advertiser box and pick their Page; "
+                                 "the URL then carries view_all_page_id, which scopes it exactly"
+                                 + (f". Their page slug looks like '{ident['facebook_slugs'][0]}'"
+    1:                              if ident["facebook_slugs"] else "")),
+               }
+       
+    2:     out["meta_eu_transparency"] = {
+    4:         "url": "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=DE"
+    2:                + (f"&view_all_page_id={ident['facebook_page_ids'][0]}" if ident["facebook_page_ids"] else ""),
+    2:         "status": "open" if ident["facebook_page_ids"] else "manual",
+    2:         "shows": "EU ads carry extra disclosure: reach, and the targeting parameters used",
+           }
+       
+    2:     out["tiktok_ads"] = {
+    2:         "url": f"https://library.tiktok.com/ads?region=all&adv_name={q(brand)}",
+    2:         "status": "open",
+    2:         "shows": "TikTok's commercial content library, where the advertiser operates in covered regions",
+           }
+    2:     out["linkedin_ads"] = {
+    2:         "url": f"https://www.linkedin.com/company/{q(brand)}/posts/?feedView=ads",
+    2:         "status": "sign-in",
+    2:         "shows": "their sponsored posts; LinkedIn shows an auth wall to signed-out visitors",
+           }
+    2:     return out
+       
+       
+    2: def parse_robots(body):
+           """Group robots.txt directives by user-agent and compare AI crawlers to `*`.
+       
+           Listing the AI crawler names on their own implied they were blocked. On one
+           live site every AI agent's rules were byte-identical to the default group
+           and the file ended `Content-Signal: ai-train=yes` -- nothing was restricted
+           at all. So report the comparison, not the names.
+           """
+    1:     groups, current = {}, []
+  139:     for raw in body.splitlines():
+  138:         line = raw.split("#")[0].strip()
+  138:         if not line or ":" not in line:
+   22:             continue
+  116:         field, _, value = line.partition(":")
+  116:         field, value = field.strip().lower(), value.strip()
+  116:         if field == "user-agent":
+    6:             if current and groups.get(tuple(current)) is not None:
+    5:                 current = []
+    6:             current.append(value)
+    6:             groups.setdefault(tuple(current), [])
+  110:         elif current:
+  110:             key = tuple(current)
+  110:             groups.setdefault(key, []).append((field, value))
+  116:         if field in ("disallow", "allow", "crawl-delay") and current:
+  109:             pass
+       
+    1:     per_agent = {}
+    7:     for agents, rules in groups.items():
+  122:         norm = tuple(sorted((f, v) for f, v in rules if f in ("disallow", "allow")))
+   12:         for a in agents:
+    6:             per_agent[a.lower()] = norm
+    1:     default = per_agent.get("*", ())
+       
+    1:     ai = {}
+    7:     for a, rules in per_agent.items():
+   12:         if not re.search(r"(gptbot|oai-|openai|chatgpt|claude|anthropic|perplexity|"
+                                r"bytespider|ccbot|google-extended|applebot-extended|"
+    6:                          r"meta-external|cohere|diffbot|omgili|timpibot|youbot)", a, re.I):
+    6:             continue
+               if any(f == "disallow" and v == "/" for f, v in rules):
+                   verdict = "BLOCKED (disallow: /)"
+               elif rules == default:
+                   verdict = "same-as-default (NOT blocked)"
+               elif len(rules) > len(default):
+                   verdict = "more restrictive than default"
+               else:
+                   verdict = "more permissive than default"
+               ai[a] = verdict
+    1:     return {
+    1:         "default_group_rules": len(default),
+    1:         "ai_crawler_verdicts": ai,
+    1:         "content_signal": (re.search(r"(?im)^\s*Content-Signal:\s*(.+)$", body).group(1).strip()
+    1:                            if re.search(r"(?im)^\s*Content-Signal:", body) else None),
+           }
+       
+       
+    2: def verify_identity(requested_host, final_url, html):
+           """Confirm the page we got actually belongs to the host we asked for.
+       
+           A CDN edge once answered a request for one company's homepage with another
+           company's cached page, complete with the wrong GTM container ID. Silently
+           reporting on the wrong company is the worst failure this tool can have, so
+           compare the canonical/og:url/title against what was requested and say so
+           loudly on a mismatch.
+           """
+    2:     base = requested_host.lower().replace("www.", "")
+    2:     seen = {}
+    6:     for name, pat in (("canonical", r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)'),
+                             ("og:url", r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)')):
+    4:         m = re.search(pat, html, re.I)
+    4:         if m:
+    2:             seen[name] = urllib.parse.urlparse(m.group(1)).netloc.lower().replace("www.", "")
+    2:     final_host = urllib.parse.urlparse(final_url or "").netloc.lower().replace("www.", "")
+    4:     mismatches = {k: v for k, v in seen.items() if v and base not in v and v not in base}
+    2:     ok = not mismatches and (not final_host or base in final_host or final_host in base)
+    2:     return {
+    2:         "requested_host": requested_host, "final_host": final_host,
+    2:         "declared_hosts": seen, "match": ok,
+    2:         "warning": (None if ok else
+                           f"IDENTITY MISMATCH: requested {requested_host} but the page declares "
+                           f"{mismatches or final_host}. A CDN edge may have served a cached page for a "
+                           f"different site. Re-fetch (try the apex domain) and confirm before using any "
+                           f"of this collection -- container IDs in it may belong to another company."),
+           }
+       
+       
+    2: def parse_csp(headers):
+           """A CSP is the site's own allowlist of every third party it talks to --
+           often a more complete stack inventory than the HTML, because it includes
+           vendors loaded later or only on other pages."""
+    2:     csp = headers.get("Content-Security-Policy") or headers.get("content-security-policy") or ""
+    2:     if not csp:
+    2:         return None
+           domains = sorted(set(re.findall(r"[*.]?([a-z0-9-]+(?:\.[a-z0-9-]+)+\.[a-z]{2,})", csp, re.I)))
+           return {"present": True, "length": len(csp), "allowed_domains": domains}
+       
+       
+    2: def parse_sitemaps(base, body, limit=3):
+           """Expand a sitemap index one level and return the URL inventory."""
+    1:     out = {"child_sitemaps": [], "sample_urls": [], "total_urls": 0, "path_prefixes": {}}
+    1:     children = re.findall(r"<sitemap>.*?<loc>(.*?)</loc>", body, re.S)
+    1:     urls = re.findall(r"<url>.*?<loc>(.*?)</loc>", body, re.S) or re.findall(r"<loc>(.*?)</loc>", body)
+    1:     if children:
+    1:         out["child_sitemaps"] = children[:40]
+    4:         for c in children[:limit]:
+    3:             r = fetch_full(c.strip())
+    3:             urls += re.findall(r"<loc>(.*?)</loc>", r["body"])
+ 1399:     urls = [u.strip() for u in urls if u.strip().startswith("http")]
+    1:     out["total_urls"] = len(urls)
+    1:     out["sample_urls"] = urls[:150]
+    1:     pref = {}
+ 1399:     for u in urls:
+ 1398:         seg = urllib.parse.urlparse(u).path.strip("/").split("/")
+ 1398:         key = "/" + (seg[0] if seg and seg[0] else "")
+ 1398:         pref[key] = pref.get(key, 0) + 1
+  258:     out["path_prefixes"] = dict(sorted(pref.items(), key=lambda x: -x[1])[:40])
+    1:     return out
+       
+       
+    2: def dns_facts(host):
+    2:     facts = {}
+    2:     try:
+   12:         facts["a_records"] = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443)})[:6]
+           except Exception:
+               pass
+    8:     for rr in ("MX", "TXT", "NS"):
+    6:         try:
+    6:             p = subprocess.run(["dig", "+short", rr, host], capture_output=True, text=True, timeout=12)
+   18:             vals = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+    5:             if vals:
+    5:                 facts[rr.lower()] = vals[:12]
+    1:         except Exception:
+    1:             pass
+           # TXT records name the SaaS vendors a company has verified a domain with --
+           # a quiet but reliable read on their stack and on pending migrations.
+    2:     txt = " ".join(facts.get("txt", []))
+    4:     vendors = sorted(set(re.findall(
+    2:         r"(google-site-verification|atlassian|facebook-domain-verification|"
+               r"ms=|MS=|adobe-idp|docusign|zoom|slack|miro|notion|asana|hubspot|"
+               r"pardot|marketo|stripe|shopify|zendesk|intercom|dropbox|canva|"
+               r"atlassian-domain-verification|apple-domain-verification|amazonses|"
+               r"sendgrid|mailgun|postmark|klaviyo|segment|logmein|webex|citrix|"
+               r"onetrust|workday|servicenow|loom|figma|github|gitlab|openai|anthropic)",
+    2:         txt, re.I)))
+    2:     if vendors:
+               facts["txt_vendor_hints"] = vendors
+    2:     return facts
+       
+       
+    2: def fetch_vwo(account_id, page_url):
+           """Fetch VWO's public settings file and pull live test names out of it.
+       
+           This is the same request a visitor's browser makes. It is the highest-value
+           artefact for "what are they testing", because campaign names come back in
+           plain text -- and it was documented in the references while the collector
+           only handled Optimizely, so every run had to build it by hand.
+           """
+           url = (f"https://dev.visualwebsiteoptimizer.com/j.php?a={account_id}"
+                  f"&u={urllib.parse.quote(page_url, safe='')}&f=1&r={0.123456}")
+           try:
+               body, status = _fetch_text(url, 20)
+           except Exception as e:
+               return {"url": url, "error": str(e)[:160]}
+           names = sorted({n.replace("\\/", "/").replace('\\"', '"')
+                           for n in re.findall(r'"name"\s*:\s*"((?:[^"\\]|\\.){3,120})"', body)})
+           types = sorted(set(re.findall(r'"type"\s*:\s*"([A-Z_]+)"', body)))
+           goals = len(re.findall(r'"goals"', body))
+           return {
+               "url": url, "status": status, "bytes": len(body),
+               "campaign_names": names[:60], "campaign_types": types,
+               "goal_blocks": goals,
+               "note": ("campaign names are the live test inventory" if names else
+                        "no plain-text campaign names in the response (account may have no running tests)"),
+           }
+       
+       
+    2: def discover_vwo_account(*blobs):
+           for b in blobs:
+               if not b:
+                   continue
+               m = (re.search(r"visualwebsiteoptimizer\.com/j\.php\?a=(\d{4,10})", b)
+                    or re.search(r"\baccount_id\s*[:=]\s*['\"]?(\d{4,10})", b)
+                    or re.search(r"_vwo_code[\s\S]{0,400}?\ba\s*=\s*(\d{4,10})", b))
+               if m:
+                   return m.group(1)
+           return None
+       
+       
+    2: def collect(target, extra_pages=(), do_containers=True):
+    2:     url = norm_url(target)
+    2:     root = fetch_full(url)
+    2:     host = urllib.parse.urlparse(root["url"] or url).netloc
+    2:     origin = f"{urllib.parse.urlparse(root['url'] or url).scheme}://{host}"
+    2:     html = root["body"]
+       
+   38:     report = {
+    2:         "target": url,
+    2:         "final_url": root["url"],
+    2:         "http_status": root["status"],
+    2:         "html_bytes": len(html),
+   60:         "response_headers": {k: v for k, v in root["headers"].items()
+   29:                              if k.lower() in {
+                                        "server", "x-powered-by", "via", "x-vercel-id", "x-vercel-cache",
+                                        "cf-ray", "cf-cache-status", "x-amz-cf-id", "x-cache",
+                                        "x-served-by", "x-nextjs-cache", "x-shopify-stage",
+                                        "x-hubspot-correlation-id", "set-cookie", "strict-transport-security",
+                                        "content-security-policy", "report-to", "permissions-policy",
+                                        "x-robots-tag", "x-drupal-cache", "x-generator"}},
+    2:         "identity": verify_identity(host, root["url"], html),
+    2:         "csp": parse_csp(root["headers"]),
+    4:         "cookies_set_on_first_load": sorted(set(re.findall(
+    2:             r"^([^=;]+)=", root["headers"].get("Set-Cookie", "") or "", re.M))),
+    4:         "meta": {
+    4:             "title": (re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I).group(1).strip()[:200]
+    2:                       if re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I) else None),
+    3:             "description": (re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{0,400})', html, re.I).group(1)
+    2:                             if re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{0,400})', html, re.I) else None),
+    2:             "generator": (re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', html, re.I).group(1)
+    2:                           if re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', html, re.I) else None),
+    2:             "hreflang_locales": sorted(set(re.findall(r'hreflang=["\']([a-zA-Z-]+)["\']', html)))[:40],
+               },
+    2:         "fingerprints": fingerprint(html),
+    2:         "third_party_hosts": third_party_hosts(html, host)[:60],
+    2:         "well_known": {},
+    2:         "sitemap": None,
+    2:         "gtm_containers": {},
+    2:         "gtag": {},
+    2:         "experimentation": {},
+    2:         "dns": dns_facts(host.replace("www.", "")) if host else {},
+    2:         "extra_pages": {},
+    2:         "collection_notes": [],
+           }
+       
+           # --- well-known paths, in parallel -----------------------------------
+    2:     def grab(path):
+   30:         return path, fetch_full(origin + path, timeout=15)
+       
+    4:     with ThreadPoolExecutor(max_workers=8) as ex:
+   32:         for path, r in ex.map(grab, WELL_KNOWN):
+   30:             if r["status"] == 200 and r["body"].strip():
+   10:                 body = r["body"]
+   10:                 entry = {"status": 200, "bytes": len(body)}
+   10:                 if path == "/robots.txt":
+    1:                     entry["disallow"] = sorted(set(re.findall(r"(?im)^\s*Disallow:\s*(\S+)", body)))[:80]
+    1:                     entry["sitemaps"] = sorted(set(re.findall(r"(?im)^\s*Sitemap:\s*(\S+)", body)))
+    1:                     entry["user_agents"] = sorted(set(re.findall(r"(?im)^\s*User-agent:\s*(\S+)", body)))[:40]
+    1:                     entry.update(parse_robots(body))
+    9:                 elif path in ("/ads.txt", "/app-ads.txt"):
+   16:                     entry["sellers"] = sorted({l.split(",")[0].strip() for l in body.splitlines()
+    8:                                                if "," in l and not l.strip().startswith("#")})[:40]
+    8:                 elif "security.txt" in path:
+    1:                     entry["excerpt"] = body[:600]
+    7:                 elif path == "/llms.txt":
+    1:                     entry["excerpt"] = body[:1200]
+                       else:
+    6:                     entry["excerpt"] = body[:500]
+   10:                 report["well_known"][path] = entry
+       
+           # --- sitemap inventory ------------------------------------------------
+    2:     sm_urls = report["well_known"].get("/robots.txt", {}).get("sitemaps") or [origin + "/sitemap.xml"]
+    4:     for sm in sm_urls[:1]:
+    2:         r = fetch_full(sm)
+    2:         if r["status"] == 200 and "<" in r["body"]:
+    1:             report["sitemap"] = {"source": sm, **parse_sitemaps(origin, r["body"])}
+       
+           # --- extra pages first, so container discovery can use them -----------
+           # Scope is a page, not a domain: one site can serve several containers, split
+           # by page template or by app vs marketing site. A homepage-only read found 1
+           # of monday.com's 3. Collect IDs from every page fetched.
+    2:     page_blobs = [html]
+    2:     for pg in extra_pages:
+               pg = pg if pg.startswith("http") else origin + ("" if pg.startswith("/") else "/") + pg
+               r = fetch_full(pg)
+               if r["status"] == 200:
+                   page_blobs.append(r["body"])
+                   pg_fp = fingerprint(r["body"])
+                   new_strong = [k for k, v in pg_fp.items()
+                                 if k not in report["fingerprints"] and v.get("evidence") != "weak"]
+                   new_weak = [k for k, v in pg_fp.items()
+                               if k not in report["fingerprints"] and v.get("evidence") == "weak"]
+                   report["extra_pages"][pg] = {
+                       "status": r["status"], "bytes": len(r["body"]),
+                       # Split here too: an integrations or comparison page is exactly
+                       # where bare vendor names show up for tools the site never loads.
+                       "new_fingerprints": new_strong,
+                       "name_only_no_load_evidence": new_weak,
+                       "forms": sorted(set(re.findall(r'<form[^>]+action=["\']([^"\']+)', r["body"], re.I)))[:15],
+                       "gtm_ids": sorted(set(re.findall(r"GTM-[A-Z0-9]{4,10}", r["body"]))),
+                   }
+               else:
+                   report["extra_pages"][pg] = {"status": r["status"]}
+       
+           # --- GTM containers ---------------------------------------------------
+    4:     gtm_ids = sorted({g for b in page_blobs for g in re.findall(r"GTM-[A-Z0-9]{4,10}", b)})
+    2:     report["container_discovery"] = {"from_pages": sorted(gtm_ids), "from_zones": []}
+    2:     if do_containers:
+    1:         queue, seen = list(gtm_ids), set()
+    1:         while queue and len(seen) < 6:
+                   gid = queue.pop(0)
+                   if gid in seen:
+                       continue
+                   seen.add(gid)
+                   try:
+                       c = analyse_container(gid)
+                       report["gtm_containers"][gid] = c
+                       # A Zone loads another container conditionally; follow it once.
+                       for z in c.get("zones", []):
+                           for child in re.findall(r"GTM-[A-Z0-9]{4,10}", json.dumps(z)):
+                               if child not in seen:
+                                   queue.append(child)
+                                   report["container_discovery"]["from_zones"].append(child)
+                   except Exception as e:
+                       report["gtm_containers"][gid] = {"error": str(e)[:300]}
+                       report["collection_notes"].append(f"container {gid} failed: {str(e)[:120]}")
+               # Form actions and links routinely point at the auth/app subdomain, which
+               # tends to host its own container. Naming those hosts turns "look harder"
+               # into a concrete next command.
+    1:         root_domain = ".".join(host.replace("www.", "").split(".")[-2:])
+    4:         sibling = sorted({
+    3:             h for b in page_blobs
+    1:             for h in re.findall(r"//([a-z0-9][a-z0-9.-]*\." + re.escape(root_domain) + r")", b, re.I)
+                   if h.lower().replace("www.", "") != host.lower().replace("www.", "")
+    1:         })[:12]
+    1:         if sibling:
+                   report["container_discovery"]["sibling_hosts"] = sibling
+                   report["collection_notes"].append(
+                       "Other hosts on this domain appear in the pages collected: "
+                       + ", ".join(sibling)
+                       + ". Each can serve its own container; re-run against them to complete the picture.")
+    1:         if len(report["gtm_containers"]) == 1:
+                   report["collection_notes"].append(
+                       "Only one container found. Sites commonly serve separate containers for the app "
+                       "or signup subdomain and for other page templates; pass --pages, or try the app "
+                       "subdomain, before treating this as the whole picture.")
+           else:
+    1:         report["gtm_containers"] = {g: "skipped (--no-containers)" for g in gtm_ids}
+       
+           # --- gtag/js for Google Tag + GA4 IDs ---------------------------------
+    2:     for gid in sorted(set(re.findall(r"G[T]?-[A-Z0-9]{8,12}", html)))[:3]:
+               try:
+                   body, status = _fetch_text(f"https://www.googletagmanager.com/gtag/js?id={gid}", 25)
+                   report["gtag"][gid] = {
+                       "status": status, "bytes": len(body),
+                       "linked_ids": sorted(set(re.findall(r"(?:AW|G|GT|DC|MC)-[A-Z0-9]{6,15}", body)))[:20],
+                   }
+               except Exception as e:
+                   report["gtag"][gid] = {"error": str(e)[:200]}
+       
+           # --- experimentation datafiles ---------------------------------------
+    2:     opt = report["fingerprints"].get("Optimizely", {}).get("ids", [])
+    2:     for key in opt[:2]:
+               for tmpl in (f"https://cdn.optimizely.com/datafiles/{key}.json",
+                            f"https://cdn.optimizely.com/public/{key}/s/_.json",
+                            f"https://cdn.optimizely.com/js/{key}.js"):
+                   try:
+                       body, status = _fetch_text(tmpl, 20)
+                       if status == 200 and not body.strip().startswith("{"):
+                           # Web Experimentation ships a JS snippet rather than a datafile.
+                           # Whether readable experiment names survive minification varies
+                           # by project, so report what is there and stay quiet otherwise.
+                           names = sorted(set(re.findall(
+                               r'"(?:experimentName|campaignName|audienceName)"\s*:\s*"([^"]{2,80})"', body)))
+                           report["experimentation"][tmpl] = {
+                               "format": "web-experimentation snippet",
+                               "bytes": len(body),
+                               "readable_names": names[:60],
+                               "note": ("no plain-text experiment names in this snippet"
+                                        if not names else "names read from snippet metadata"),
+                           }
+                           break
+                       if status == 200 and body.strip().startswith("{"):
+                           d = json.loads(body)
+                           report["experimentation"][tmpl] = {
+                               "experiments": [e.get("key") for e in d.get("experiments", [])][:80],
+                               "feature_flags": [f.get("key") for f in d.get("featureFlags", [])][:80],
+                               "events": [e.get("key") for e in d.get("events", [])][:80],
+                               "audiences": [a.get("name") for a in d.get("audiences", [])][:40],
+                           }
+                           break
+                   except Exception:
+                       continue
+       
+           # --- widen fingerprinting beyond the HTML -----------------------------
+           # Most vendors are injected by GTM at runtime, so they never appear in the
+           # served HTML. Two places do see them: the CSP allowlist (the site had to
+           # permit the domain) and the container's own Custom HTML hosts. Folding those
+           # in is what turns "6 vendors" into the real stack.
+    2:     widened = {}
+    2:     if report["csp"]:
+               widened.update(fingerprint(" ".join(report["csp"]["allowed_domains"]), source="csp"))
+    2:     container_hosts = []
+    2:     for gid, c in report["gtm_containers"].items():
+               if isinstance(c, dict) and not c.get("error"):
+                   container_hosts += [h["host"] for h in c.get("custom_html_hosts", [])]
+                   for t in c.get("custom_templates", []):
+                       container_hosts += t.get("fingerprint", {}).get("hosts", [])
+                       container_hosts += t.get("fingerprint", {}).get("globals", [])
+    2:     if container_hosts:
+               for k, v in fingerprint(" ".join(container_hosts), source="gtm-container").items():
+                   widened.setdefault(k, v)
+    2:     for k, v in widened.items():
+               if k not in report["fingerprints"]:
+                   report["fingerprints"][k] = v
+    2:     report["stack_sources_note"] = (
+    2:         "A vendor seen only in 'csp' or 'gtm-container' is still live -- it is "
+               "loaded at runtime rather than written into the served HTML.")
+       
+           # --- who they are as an advertiser, and where to watch their ads ------
+    2:     report["advertiser"] = advertiser_identity(html, host, report["gtm_containers"])
+    2:     report["ad_libraries"] = ad_library_links(report["advertiser"])
+       
+           # --- VWO settings file (live test names) ------------------------------
+           # Runs last, because VWO is usually detected from the container rather than
+           # the HTML, so the fingerprint set has to be widened first.
+    2:     if "VWO" in report["fingerprints"]:
+               acct = None
+               for c in report["gtm_containers"].values():
+                   if isinstance(c, dict):
+                       got = (c.get("vendor_account_ids") or {}).get("vwo")
+                       if got:
+                           acct = got[0]
+                           break
+               acct = acct or discover_vwo_account(html, json.dumps(report["gtm_containers"], default=str))
+               if acct:
+                   report["experimentation"][f"vwo:{acct}"] = fetch_vwo(acct, report["final_url"] or url)
+               else:
+                   report["collection_notes"].append(
+                       "VWO detected but no account ID found; grep the raw gtm.js for _vwo_code "
+                       "or visualwebsiteoptimizer.com/j.php?a=")
+       
+    2:     return report
+       
+       
+    2: def render(r):
+    2:     L = []
+    2:     a = L.append
+    2:     a(f"# Public recon: {r['final_url']}   (HTTP {r['http_status']}, {r['html_bytes']:,} bytes HTML)")
+    2:     ident = r.get("identity") or {}
+    2:     if ident.get("warning"):
+               a("")
+               a("!! " + ident["warning"])
+               a("")
+    2:     if r["meta"]["title"]:
+    2:         a(f"title: {r['meta']['title']}")
+    2:     if r["meta"]["generator"]:
+               a(f"generator: {r['meta']['generator']}")
+    2:     if r["meta"]["hreflang_locales"]:
+    1:         a(f"locales (hreflang): {', '.join(r['meta']['hreflang_locales'])}")
+       
+    2:     a("\n## Response headers")
+   10:     for k, v in r["response_headers"].items():
+    8:         a(f"  {k}: {str(v)[:220]}")
+    2:     if r["cookies_set_on_first_load"]:
+               a(f"  cookies set pre-consent: {', '.join(r['cookies_set_on_first_load'])}")
+       
+    2:     if r["csp"]:
+               doms = r["csp"]["allowed_domains"]
+               a(f"\n## CSP allowlist ({len(doms)} domains) - their own inventory of third parties")
+               if len(doms) < 3:
+                   a("  PERMISSIVE OR EMPTY CSP (e.g. default-src *): this says nothing about their stack.")
+                   a("  Read it as 'no information', not as a small vendor footprint.")
+               a("  " + ", ".join(doms[:80]))
+           else:
+    2:         a("\n## CSP: none served")
+    2:         a("  No CSP means the stack-enumeration shortcut is unavailable here, not that the")
+    2:         a("  stack is thin. Fall back to container hosts and the --pages sweep.")
+       
+    3:     strong = {k: v for k, v in r["fingerprints"].items() if v.get("evidence") != "weak"}
+    3:     weak = {k: v for k, v in r["fingerprints"].items() if v.get("evidence") == "weak"}
+    2:     a(f"\n## Vendor fingerprints ({len(strong)} with load evidence)")
+    3:     for k, v in strong.items():
+    1:         ids = f"  ids={v['ids']}" if v["ids"] else ""
+    1:         src = v.get("source", "html")
+    1:         tag = "" if src == "html" else f"  [seen in {src}]"
+    1:         a(f"  {k:<28} x{v['occurrences']:<3} {v['implies']}{ids}{tag}")
+    2:     if r.get("stack_sources_note"):
+    2:         a(f"  note: {r['stack_sources_note']}")
+    2:     if weak:
+               a(f"\n## Name mentioned, no load evidence ({len(weak)}) -- verify before reporting")
+               a("   (a bare product name also matches an integrations directory or a competitor list)")
+               for k, v in weak.items():
+                   a(f"  {k:<28} x{v['occurrences']:<3} matched text only")
+       
+    2:     if r["third_party_hosts"]:
+    1:         a("\n## Third-party hosts referenced in HTML")
+   26:         for h in r["third_party_hosts"][:35]:
+   25:             a(f"  {h['refs']:>3}  {h['host']}")
+       
+   12:     for path, e in r["well_known"].items():
+   10:         a(f"\n## {path}  ({e['bytes']:,} bytes)")
+   10:         if e.get("ai_crawler_verdicts"):
+                   a("  AI crawlers:")
+                   for agent, verdict in sorted(e["ai_crawler_verdicts"].items()):
+                       a(f"    {agent:<28} {verdict}")
+   10:         elif path == "/robots.txt":
+    1:             a("  AI crawlers: none named in robots.txt")
+   10:         if e.get("content_signal"):
+                   a(f"  Content-Signal: {e['content_signal']}")
+   50:         for key in ("disallow", "sitemaps", "sellers", "user_agents"):
+   40:             if e.get(key):
+    3:                 a(f"  {key}: {', '.join(map(str, e[key][:40]))}")
+   10:         if e.get("excerpt"):
+    8:             a("  " + e["excerpt"][:400].replace("\n", "\n  "))
+       
+    2:     if r["sitemap"]:
+    1:         s = r["sitemap"]
+    1:         a(f"\n## Sitemap ({s['total_urls']:,} URLs from {s['source']})")
+   27:         a("  top path prefixes: " + ", ".join(f"{k} ({v})" for k, v in list(s["path_prefixes"].items())[:25]))
+       
+    2:     if r["gtag"]:
+               a("\n## gtag/js")
+               for gid, v in r["gtag"].items():
+                   a(f"  {gid}: linked -> {', '.join(v.get('linked_ids', [])) or v.get('error', 'none')}")
+       
+    2:     adv = r.get("advertiser") or {}
+    2:     if r.get("ad_libraries"):
+    2:         a("\n## Live ads - open these to see what they are running right now")
+    2:         if adv.get("google_ads_accounts"):
+                   a(f"  google ads accounts in their container: {', '.join(adv['google_ads_accounts'])}")
+    2:         if adv.get("facebook_page_ids"):
+    1:             a(f"  facebook page id: {', '.join(adv['facebook_page_ids'])}")
+    1:         elif adv.get("facebook_slugs"):
+                   a(f"  facebook page slug: {', '.join(adv['facebook_slugs'][:3])}  (no numeric id published)")
+    2:         if adv.get("meta_pixel_ids"):
+                   a(f"  meta pixel ids: {', '.join(adv['meta_pixel_ids'][:4])}")
+    2:         a("")
+   12:         for name, v in r["ad_libraries"].items():
+   10:             flag = {"open": "OPEN     ", "manual": "1 STEP   ", "sign-in": "SIGN-IN  "}.get(v["status"], "         ")
+   10:             a(f"  {flag}{name}")
+   10:             a(f"      {v['url']}")
+   10:             a(f"      {v['shows']}")
+   10:             if v.get("next_step"):
+    1:                 a(f"      next: {v['next_step']}")
+       
+    2:     if r["experimentation"]:
+               a("\n## Experimentation datafiles (public)")
+               for u, v in r["experimentation"].items():
+                   a(f"  {u}")
+                   for key in ("experiments", "feature_flags", "events", "audiences",
+                               "readable_names", "campaign_names", "campaign_types"):
+                       if v.get(key):
+                           a(f"    {key} ({len(v[key])}): {', '.join(map(str, v[key][:30]))}")
+                   if v.get("note"):
+                       a(f"    note: {v['note']}  ({v.get('format','')}, {v.get('bytes',0):,} bytes)")
+       
+    2:     if r["dns"]:
+    2:         a("\n## DNS")
+    9:         for k, v in r["dns"].items():
+    7:             a(f"  {k}: {', '.join(map(str, v[:8]))[:400]}")
+       
+    2:     if r["extra_pages"]:
+               a("\n## Extra pages")
+               for p, v in r["extra_pages"].items():
+                   a(f"  {p}  HTTP {v['status']}")
+                   if v.get("new_fingerprints"):
+                       a(f"    page-only vendors: {', '.join(v['new_fingerprints'])}")
+                   if v.get("name_only_no_load_evidence"):
+                       a(f"    name-only on this page (verify): {', '.join(v['name_only_no_load_evidence'])}")
+                   if v.get("forms"):
+                       a(f"    form actions: {', '.join(v['forms'][:8])}")
+       
+    2:     cd_ = r.get("container_discovery") or {}
+    2:     a(f"\n## GTM containers found: {', '.join(r['gtm_containers'].keys()) or 'none'}")
+    2:     if cd_:
+    4:         a(f"   from pages: {', '.join(cd_.get('from_pages', [])) or 'none'}"
+    2:           f"   from zones: {', '.join(cd_.get('from_zones', [])) or 'none'}")
+    2:         if cd_.get("sibling_hosts"):
+                   a(f"   other hosts on this domain (may have their own containers): "
+                     f"{', '.join(cd_['sibling_hosts'])}")
+    2:     a("   (run scripts/gtm_parse.py <ID> for the full container read, or see --json)")
+    2:     if r["collection_notes"]:
+               a("\n## Collection notes")
+               for n in r["collection_notes"]:
+                   a(f"  - {n}")
+    2:     return "\n".join(L)
+       
+       
+    2: def main():
+           # An explicit --help is a request that succeeded, so it exits 0. Running with
+           # no arguments at all is a usage error and still exits 1.
+    2:     if "--help" in sys.argv or "-h" in sys.argv:
+               print(__doc__)
+               return 0
+    2:     argv = sys.argv[1:]
+    2:     if not argv:
+               print(__doc__)
+               return 1
+    2:     target = argv[0]
+    2:     pages = []
+    2:     out_json = None
+    2:     if "--pages" in argv:
+               pages = [p.strip() for p in argv[argv.index("--pages") + 1].split(",") if p.strip()]
+    2:     if "--json" in argv:
+               i = argv.index("--json")
+               out_json = argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith("--") else "recon.json"
+    2:     rep = collect(target, pages, do_containers="--no-containers" not in argv)
+    2:     print(render(rep))
+    2:     if out_json:
+               with open(out_json, "w", encoding="utf-8") as fh:
+                   json.dump(rep, fh, indent=2, default=str)
+               print(f"\n[raw facts written to {out_json}]")
+    2:     return 0
+       
+       
+    2: if __name__ == "__main__":
+    2:     sys.exit(main())

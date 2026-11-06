@@ -5,7 +5,7 @@
 **Audit the marketing and measurement stack a website exposes to every visitor.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](#requirements)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#requirements)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#requirements)
 [![Agent skill](https://img.shields.io/badge/agent%20skill-skills.sh-6f42c1.svg)](https://skills.sh)
 [![Stars](https://img.shields.io/github/stars/brenoepics/growth-recon-skill?style=flat&color=yellow)](https://github.com/brenoepics/growth-recon-skill/stargazers)
@@ -18,14 +18,27 @@ npx skills add brenoepics/growth-recon-skill
 
 ---
 
-A website's tracking configuration is delivered to the browser as a static file, which means it can be read directly. `growth-recon` parses that file and the other public surfaces around it, then reports what a site measures, what it bids toward, which vendors it actually loads, and the conditions a tag waits for before it fires.
+Point it at a company's website. It reads what that site already hands to every
+visitor, then writes you a report on how the company actually grows.
 
-It also watches the page actually run, points you at the ad libraries where the campaigns that tracking was built to measure are on public display, and reads the pricing, hiring and archived history around it.
+**What you get back**
 
-It works as a skill your agent invokes in conversation, or as two standalone Python scripts.
+- **Their funnel, in their own words.** The event names their team typed, ordered into the funnel they describe.
+- **What they pay to get.** Which conversions they feed to Google Ads, separated from how many ad accounts they run.
+- **What a customer is worth to them**, where they leave it readable. One target sets a lead's value by region. Another fires its conversions at a value of zero.
+- **The rule that defines a lead.** One company only counts a demo if the form says 20 or more staff. Their LinkedIn tags carry no such rule, so two ad platforms learn from different people.
+- **What they are testing right now**, by campaign name.
+- **The ads they are running today**, with the creative and the headline.
+- **What they charge**, and the exact tier where self-serve stops and a salesperson starts.
+- **Who they are hiring**, which names the tools they use and the teams they are building.
+- **What changed since last year**, by diffing their setup against its own archived history.
+
+**How it works.** A website cannot hide its tracking setup. The browser needs that file to run the tracking, so the file is public, and every detail above sits in it or in a public record next to it: an ad library, a job board, an archive, a pricing page.
+
+**How you use it.** Ask your agent in plain language. It picks the right tools and writes the report. The eight scripts also run on their own if you prefer a terminal.
 
 > [!NOTE]
-> **Read-only and unauthenticated.** It requests the same things a browser does: the served HTML, response headers, referenced scripts, the published tag container, and standard well-known paths. It will not sign in, submit forms, create test leads, or probe unlisted paths.
+> **Read-only, and never signed in.** It asks for the same things a browser asks for: the page, its headers, the scripts it loads, the published tag container, and the standard public files like `robots.txt`. It will not log in, fill a form, start a trial, or go looking for hidden pages.
 
 <br>
 
@@ -329,7 +342,50 @@ No build step, no lockfile, no dependencies.
 
 ## Requirements
 
-Python 3.8 or newer, standard library only — there is nothing to install with pip. Node is needed only for the install command, and a Chromium-family browser only if you want PDF output. `curl` is used as a fallback when Python's certificate store is unconfigured, which is common on macOS.
+**Python 3.9 or newer**, standard library only. Nothing to install with pip.
+
+Tested on 3.9.6 and 3.14. It very likely runs on 3.8, but that is untested, so the badge claims what has actually been verified.
+
+| Platform | Python present? |
+| :--- | :--- |
+| macOS | Yes, `/usr/bin/python3` (3.9.6 on current releases) |
+| Linux | Yes, on effectively every distribution |
+| Windows | **No** — install it from python.org or the Microsoft Store |
+
+Node is needed only for the install command, and a Chromium-family browser only if you want PDF output. `curl` is used as a fallback when Python's certificate store is unconfigured, which is common on macOS.
+
+The scripts speed the work up; they are not the skill. An agent that finds no Python can still follow `SKILL.md` and do the same reading with its own tools, just more slowly.
+
+<br>
+
+## Testing
+
+There is no automated test suite. Every module was built and checked by running
+it against live websites and reading the output, which found real bugs but is
+not the same thing as tests.
+
+Measured line coverage from 15 representative runs:
+
+| Module | Coverage |
+| :--- | ---: |
+| `gtm_parse.py` | 76% |
+| `runtime_parse.py` | 68% |
+| `report_pdf.py` | 64% |
+| `pricing.py` | 63% |
+| `company.py` | 62% |
+| `recon.py` | 48% |
+| `compare.py` | 30% |
+| `history.py` | 17% |
+| **Overall** | **54%** |
+
+The uncovered half is mostly error handling, fallback paths, and vendor decoders
+that did not fire on the sites tested. Some of those are known untested: the
+Meta, LinkedIn, Snapchat and Reddit decoders in `runtime_parse.py` were written
+against documented parameter shapes, because no live hit for them was captured
+during development. Treat their output as unverified until you see one.
+
+Contributions that add tests are more useful than contributions that add
+features.
 
 <br>
 

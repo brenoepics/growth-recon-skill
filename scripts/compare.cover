@@ -1,0 +1,955 @@
+       #!/usr/bin/env python3
+    1: """Compare several sites' public growth setups, so each number has a baseline.
+       
+       A single-site report says "364 tags" and "27 conversion actions". No reader can
+       tell whether either of those is a lot, because there is nothing to read them
+       against. This script collects several targets with the same collector and puts
+       the same measurements side by side, which is what makes any one of them mean
+       something.
+       
+       Usage:
+           python3 compare.py asana.com monday.com clickup.com
+           python3 compare.py a.com b.com c.com --json cmp.json
+           python3 compare.py a.com b.com c.com --fast        # skip container parsing
+           python3 compare.py --regional monday.com           # one company's variants
+           python3 compare.py a.com b.com --pages /pricing,/demo
+       
+       Two modes:
+       
+         default      several companies, measured the same way and ranked by what
+                      separates them.
+       
+         --regional   one company's regional (ccTLD) and functional (subdomain)
+                      variants, reporting which of them serve a *different* tag
+                      container. Different markets and the signup app routinely run
+                      their own containers with their own conversion actions, so a
+                      homepage-only read understates the setup.
+       
+       Output leads with what differentiates the targets. Per-target inventories come
+       last, because an inventory of one target is what recon.py already prints.
+       """
+       
+    1: import json
+    1: import os
+    1: import re
+    1: import socket
+    1: import statistics
+    1: import sys
+    1: import urllib.parse
+    1: from concurrent.futures import ThreadPoolExecutor
+       
+    1: sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    1: from recon import collect, fetch_full, fingerprint, norm_url  # noqa: E402
+    1: from gtm_parse import analyse as analyse_container  # noqa: E402
+       
+       # recon.collect() parses every container it finds, so one target is tens of
+       # requests and several seconds of CPU. Targets run concurrently to make a
+       # multi-target run bearable, but the pool stays small: each worker is a separate
+       # host seeing an ordinary visitor's request pattern, and a wide pool would turn
+       # a comparison into something that looks like a scan.
+    1: DEFAULT_WORKERS = 3
+    1: MAX_WORKERS = 4
+       
+       # A median over three numbers is just the middle one. Below this many targets,
+       # say that in the output instead of dressing it up as a benchmark.
+    1: MIN_FOR_STATS = 4
+       
+       # The measurements compared across targets. Order is the fallback reading order;
+       # the lead section re-sorts by how much each one actually separates the set.
+       # (key, long label, unit, short label for one-line summaries)
+    1: METRICS = [
+           ("containers", "GTM containers served", "count", "containers"),
+           ("tags", "tags across those containers", "count", "tags"),
+           ("ga4_events", "distinct GA4 event names", "count", "GA4 events"),
+           ("ads_accounts", "Google Ads accounts", "count", "Ads accounts"),
+           ("conversion_actions", "distinct Ads conversion actions", "count", "conversion actions"),
+           ("consent_share_pct", "tags declaring consent requirements", "pct", "consent share"),
+           ("vendors", "vendors with load evidence", "count", "vendors"),
+           ("lookup_tables", "lookup tables in containers", "count", "lookup tables"),
+           ("sitemap_urls", "URLs in sitemap", "count", "sitemap URLs"),
+       ]
+       
+       # Measurements that only exist once a container has been parsed, so --fast can
+       # explain their absence in one line instead of flagging every target.
+    1: CONTAINER_METRICS = {"tags", "ga4_events", "ads_accounts", "conversion_actions",
+                            "consent_share_pct", "lookup_tables"}
+       
+       # Regional forms a brand actually registers, including the two-part public
+       # suffixes. Every candidate is DNS-gated before any HTTP request, so this list
+       # costs resolver lookups rather than requests to the company's web servers.
+   58: REGIONAL_SUFFIXES = [
+   12:     "co.uk", "uk", "de", "fr", "es", "it", "nl", "be", "ch", "at", "se", "no",
+   11:     "dk", "fi", "pl", "cz", "pt", "ie", "gr", "tr", "com.tr", "ru", "com.br",
+    9:     "mx", "com.mx", "com.ar", "cl", "co", "ca", "com.au", "co.nz", "co.jp",
+   10:     "jp", "co.kr", "kr", "cn", "com.cn", "tw", "com.tw", "hk", "sg", "com.sg",
+   10:     "in", "co.in", "id", "co.id", "co.th", "vn", "ph", "my", "com.my", "ae",
+    5:     "sa", "il", "co.il", "co.za", "eu",
+       ]
+       
+       # Functional subdomains worth testing when the collected pages do not already
+       # name them. The signup/auth host is the one that matters most: it is where the
+       # conversion actually happens, and it is frequently a different container.
+    1: LIKELY_SUBDOMAINS = [
+           "app", "auth", "login", "signup", "start", "try", "go", "get", "my",
+           "account", "shop", "store", "help", "support", "docs", "blog", "learn",
+           "community", "partners", "developers", "status", "careers", "jobs",
+       ]
+       
+       
+       # ---------------------------------------------------------------------------
+       # domain shapes
+       # ---------------------------------------------------------------------------
+       
+    1: TWO_PART = {"co", "com", "org", "net", "gov", "edu", "ac"}
+       
+       
+    1: def split_host(host):
+           """Return (apex, brand, suffix) for a hostname.
+       
+           Needed because a regional sweep has to swap the suffix while keeping the
+           brand, and the naive "second label from the right" is wrong for the two-part
+           public suffixes a sweep is specifically looking for: example.co.uk's brand
+           is example, not co.
+           """
+           labels = [l for l in host.lower().strip(".").replace("www.", "").split(".") if l]
+           if len(labels) >= 3 and labels[-2] in TWO_PART and len(labels[-1]) == 2:
+               return ".".join(labels[-3:]), labels[-3], ".".join(labels[-2:])
+           if len(labels) >= 2:
+               return ".".join(labels[-2:]), labels[-2], labels[-1]
+           return host, host, ""
+       
+       
+    1: def host_of(url_or_host):
+           u = norm_url(url_or_host)
+           return urllib.parse.urlparse(u).netloc.lower()
+       
+       
+    1: def resolves(host):
+           """Does this hostname exist at all?
+       
+           The gate that keeps a regional sweep polite. Most brand.ccTLD guesses do not
+           exist, and resolving them asks a DNS resolver rather than knocking on fifty
+           web servers that were never there.
+           """
+           try:
+               socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+               return True
+           except Exception:
+               return False
+       
+       
+       # ---------------------------------------------------------------------------
+       # profiles: one comparable row per target
+       # ---------------------------------------------------------------------------
+       
+    1: def _container_rollup(containers):
+           """Fold several parsed containers into one set of per-target numbers.
+       
+           Union rather than sum for the identity-like things: two containers on one
+           site routinely declare the same GA4 events and the same Ads account, and
+           summing those would reward duplication as if it were coverage.
+           """
+    2:     tags = consent_tags = consent_total = lookups = 0
+    2:     ga4, ga4_dynamic, labels, accounts = set(), set(), set(), set()
+    2:     per_container, parsed = {}, 0
+    2:     for gid, c in containers.items():
+               if not isinstance(c, dict) or c.get("error"):
+                   per_container[gid] = None
+                   continue
+               parsed += 1
+               n = (c.get("counts") or {}).get("tags", 0)
+               per_container[gid] = n
+               tags += n
+               # An event whose name is built at runtime has no name to compare. Its
+               # placeholder ("<Event name>", or a raw macro expression) would otherwise
+               # show up as vocabulary the targets share, which is the opposite of true.
+               for e in c.get("ga4_events", []):
+                   (ga4_dynamic if e.get("dynamic_name") else ga4).add(str(e.get("event_name")))
+               g = c.get("google_ads_summary") or {}
+               labels |= set(g.get("labels") or [])
+               accounts |= set(g.get("ads_accounts") or [])
+               cs = c.get("consent") or {}
+               consent_tags += cs.get("consent_aware_tags", 0)
+               consent_total += cs.get("total_tags", 0)
+               lookups += len(c.get("lookup_tables") or [])
+    2:     return {
+    2:         "parsed": parsed,
+    2:         "per_container_tags": per_container,
+    2:         "tags": tags,
+    2:         "ga4_events": sorted(ga4),
+    2:         "ga4_dynamic_events": sorted(ga4_dynamic),
+    2:         "conversion_actions": sorted(labels),
+    2:         "ads_accounts": sorted(accounts),
+    2:         "consent_share_pct": (100.0 * consent_tags / consent_total) if consent_total else None,
+    2:         "lookup_tables": lookups,
+           }
+       
+       
+    1: def profile_from_collection(label, r, do_containers=True):
+           """Build the comparable row from a full recon.collect() result."""
+    2:     all_containers = r.get("gtm_containers") or {}
+    2:     containers = {g: c for g, c in all_containers.items() if isinstance(c, dict)}
+    2:     roll = _container_rollup(containers)
+    2:     for gid in all_containers:
+               roll["per_container_tags"].setdefault(gid, None)
+    4:     strong = {k for k, v in (r.get("fingerprints") or {}).items()
+    1:               if v.get("evidence") != "weak"}
+    2:     sitemap = (r.get("sitemap") or {}).get("total_urls")
+       
+    2:     prof = {
+    2:         "label": label,
+    2:         "ok": True,
+    2:         "depth": "full collection",
+    2:         "final_url": r.get("final_url"),
+    2:         "http_status": r.get("http_status"),
+    2:         "containers": sorted((r.get("gtm_containers") or {}).keys()),
+    2:         "per_container_tags": roll["per_container_tags"],
+    2:         "vendors": sorted(strong),
+    2:         "ga4_event_names": roll["ga4_events"],
+    2:         "ga4_runtime_named_events": len(roll["ga4_dynamic_events"]),
+    2:         "conversion_action_labels": roll["conversion_actions"],
+    2:         "ads_account_ids": roll["ads_accounts"],
+    2:         "sibling_hosts": (r.get("container_discovery") or {}).get("sibling_hosts", []),
+    2:         "notes": list(r.get("collection_notes") or []),
+    4:         "metrics": {
+    2:             "containers": len(r.get("gtm_containers") or {}),
+    2:             "tags": roll["tags"] if do_containers and roll["parsed"] else None,
+    2:             "ga4_events": (len(roll["ga4_events"]) + len(roll["ga4_dynamic_events"])
+    2:                            if do_containers and roll["parsed"] else None),
+    2:             "ads_accounts": len(roll["ads_accounts"]) if do_containers and roll["parsed"] else None,
+    2:             "conversion_actions": (len(roll["conversion_actions"])
+    2:                                    if do_containers and roll["parsed"] else None),
+    2:             "consent_share_pct": roll["consent_share_pct"],
+    2:             "vendors": len(strong),
+    2:             "lookup_tables": roll["lookup_tables"] if do_containers and roll["parsed"] else None,
+    2:             "sitemap_urls": sitemap,
+               },
+           }
+   14:     google_direct = [k for k in ("Google Ads", "GA4 measurement ID", "Google Tag ID")
+    6:                      if k in (r.get("fingerprints") or {})]
+    2:     prof["tags_without_a_container"] = bool(google_direct) and not all_containers
+    2:     prof["google_tags_in_html"] = google_direct
+       
+    2:     ident = r.get("identity") or {}
+    2:     if ident.get("warning"):
+               prof["identity_warning"] = ident["warning"]
+    2:     if not r.get("html_bytes"):
+               prof["ok"] = False
+               prof["gap"] = f"no HTML served (HTTP {r.get('http_status')})"
+    2:     return prof
+       
+       
+    1: def gap_profile(label, reason):
+           """A target that failed is a gap in the comparison, not a zero.
+       
+           Reporting a timeout as 0 tags would quietly drag every statistic down and
+           read as a company with no tracking, which is the wrong finding entirely.
+           """
+           return {"label": label, "ok": False, "gap": reason, "depth": "failed",
+                   "containers": [], "vendors": [], "ga4_event_names": [],
+                   "conversion_action_labels": [], "ads_account_ids": [], "notes": [],
+                   "metrics": {k: None for k, _, _, _ in METRICS}}
+       
+       
+    1: def collect_one(target, pages, do_containers):
+    2:     try:
+    2:         r = collect(target, pages, do_containers=do_containers)
+           except Exception as e:
+               return gap_profile(target, f"collection failed: {type(e).__name__}: {str(e)[:160]}")
+    2:     return profile_from_collection(target, r, do_containers)
+       
+       
+    1: def collect_many(targets, pages=(), do_containers=True, workers=DEFAULT_WORKERS):
+    1:     workers = max(1, min(workers, MAX_WORKERS, len(targets)))
+    2:     with ThreadPoolExecutor(max_workers=workers) as ex:
+    3:         return list(ex.map(lambda t: collect_one(t, pages, do_containers), targets))
+       
+       
+       # ---------------------------------------------------------------------------
+       # cross-target statistics
+       # ---------------------------------------------------------------------------
+       
+    1: def fmt(v, kind):
+   23:     if v is None:
+   11:         return "n/a"
+   12:     if kind == "pct":
+               return f"{v:.0f}%"
+   12:     if isinstance(v, float) and v.is_integer():
+               v = int(v)
+   12:     return f"{v:,}"
+       
+       
+    1: def stat_block(profiles):
+           """min / median / max per metric, with who sits at each end.
+       
+           The whole point of the feature: a number is only large or small relative to
+           the set, so every metric carries the names of the targets holding the
+           extremes rather than bare figures.
+           """
+    1:     out = {}
+   10:     for key, label, kind, short in METRICS:
+   63:         pairs = [(p["label"], p["metrics"].get(key)) for p in profiles
+   36:                  if p.get("ok") and p["metrics"].get(key) is not None]
+    9:         if len(pairs) < 2:
+    7:             continue
+    6:         vals = [v for _, v in pairs]
+    2:         lo, hi = min(vals), max(vals)
+    2:         mid = statistics.median(vals)
+               # Relative spread, so a metric measured in thousands (sitemap URLs)
+               # doesn't automatically outrank one measured in tens (conversion
+               # actions) when ranking what actually differentiates the set.
+    2:         denom = mid if mid else (hi if hi else 1)
+    2:         out[key] = {
+    2:             "label": label, "short": short, "kind": kind, "n": len(pairs),
+    2:             "min": lo, "median": mid, "max": hi,
+    2:             "spread": (hi - lo) / denom,
+    8:             "holders_max": sorted(n for n, v in pairs if v == hi),
+    8:             "holders_min": sorted(n for n, v in pairs if v == lo),
+    2:             "values": dict(pairs),
+               }
+    1:     return out
+       
+       
+    1: def outlier_summary(profiles, stats):
+           """Per target, the metrics where it alone holds an extreme.
+       
+           This is the read a single-site report cannot produce: not "27 conversion
+           actions" but "more conversion actions than anyone else here".
+           """
+    1:     summary = {}
+    3:     for p in profiles:
+    2:         if not p.get("ok"):
+                   continue
+    2:         rows = []
+    6:         for key, s in stats.items():
+    4:             if s["max"] == s["min"]:
+    2:                 continue
+    2:             if s["holders_max"] == [p["label"]]:
+    1:                 rows.append(("highest", key, s))
+    1:             elif s["holders_min"] == [p["label"]]:
+    1:                 rows.append(("lowest", key, s))
+    2:         summary[p["label"]] = rows
+    1:     return summary
+       
+       
+    1: def vendor_sets(profiles):
+    3:     ok = [p for p in profiles if p.get("ok")]
+    1:     if not ok:
+               return {"common": [], "unique": {}, "spread": []}
+    3:     sets = {p["label"]: set(p["vendors"]) for p in ok}
+    1:     common = set.intersection(*sets.values()) if sets else set()
+    1:     unique = {}
+    3:     for name, s in sets.items():
+    6:         others = set.union(*[v for k, v in sets.items() if k != name]) if len(sets) > 1 else set()
+    2:         unique[name] = sorted(s - others)
+           # Vendors held by some but not all: the choices that are contested rather
+           # than either table stakes or one company's quirk.
+    1:     allv = set.union(*sets.values())
+    4:     contested = sorted(v for v in allv - common
+    4:                        if not any(v in u for u in unique.values()))
+    1:     return {"common": sorted(common), "unique": unique, "contested": contested}
+       
+       
+       # ---------------------------------------------------------------------------
+       # regional / functional variant sweep
+       # ---------------------------------------------------------------------------
+       
+    1: def variant_candidates(apex, brand, suffix, discovered):
+           """ccTLD forms of the brand plus functional subdomains of the apex."""
+           cands = []
+           for s in REGIONAL_SUFFIXES:
+               if s == suffix:
+                   continue
+               cands.append((f"{brand}.{s}", "regional ccTLD"))
+           for h in discovered:
+               cands.append((h.lower(), "subdomain seen in the collected pages"))
+           for p in LIKELY_SUBDOMAINS:
+               cands.append((f"{p}.{apex}", "likely functional subdomain"))
+           seen, out = set(), []
+           for h, why in cands:
+               h = h.lower().strip(".")
+               if h in seen or h == apex or h == "www." + apex:
+                   continue
+               seen.add(h)
+               out.append({"host": h, "why": why})
+           return out
+       
+       
+    1: def probe_variant(v, base_apex, brand, base_ids=()):
+           """One request per variant host: enough to read its container IDs.
+       
+           Deliberately not a full collect(). A sweep touches many hosts, so each gets
+           a single homepage request like any visitor, and only the containers that
+           turn out to be new are parsed afterwards.
+           """
+           host = v["host"]
+           url = "https://" + host
+           r = fetch_full(url, timeout=18)
+           html = r.get("body") or ""
+           final_host = urllib.parse.urlparse(r.get("url") or url).netloc.lower()
+           title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+           out = dict(v)
+           out.update({
+               "status": r.get("status"),
+               "final_host": final_host,
+               "bytes": len(html),
+               "title": (title.group(1).strip()[:120] if title else None),
+               "containers": sorted(set(re.findall(r"GTM-[A-Z0-9]{4,10}", html))),
+               "ga4_ids": sorted(set(re.findall(r"G-[A-Z0-9]{8,12}", html))),
+               "vendors": sorted(k for k, d in fingerprint(html).items()
+                                 if d.get("evidence") != "weak"),
+           })
+           out["redirects_into_base"] = bool(final_host) and final_host.replace("www.", "").endswith(base_apex)
+       
+           # A brand's ccTLD very often belongs to somebody else: on a live sweep,
+           # monday.com.br served a Brazilian ecommerce tool and monday.pt a design
+           # studio, each with its own container. Attributing those to the company
+           # would be the worst failure available here, and the brand name appearing on
+           # the page proves nothing -- it is in the hostname. So require positive
+           # evidence tying the variant to the base company, and park everything else
+           # as unconfirmed instead of counting it.
+           ev = []
+           if host == base_apex or host.endswith("." + base_apex):
+               ev.append("on the base domain")
+           if out["redirects_into_base"]:
+               ev.append("redirects into the base host")
+           if re.search(r"//(?:[a-z0-9-]+\.)*" + re.escape(base_apex) + r"\b", html, re.I):
+               ev.append("its page references the base domain")
+           shared = sorted((set(out["containers"]) | set(out["ga4_ids"])) & set(base_ids))
+           if shared:
+               ev.append("shares " + ", ".join(shared) + " with the base site")
+           # No page means no evidence either way, so an unreachable host is a gap --
+           # not a verdict that somebody else owns it.
+           out["served_a_page"] = r.get("status") == 200 and bool(html.strip())
+           out["same_company_evidence"] = ev
+           out["same_company"] = bool(ev)
+           hay = ((out["title"] or "") + " " + html[:4000]).lower()
+           out["brand_on_page"] = brand in hay
+           return out
+       
+       
+    1: def sweep_regional(target, pages=(), do_containers=True, workers=DEFAULT_WORKERS):
+           base_host = host_of(target)
+           apex, brand, suffix = split_host(base_host)
+       
+           base_raw = collect(target, pages, do_containers=do_containers)
+           base = profile_from_collection(apex, base_raw, do_containers)
+           base_containers = set(base["containers"])
+       
+           discovered = [h for h in base.get("sibling_hosts", [])
+                         if h.lower().endswith(apex)]
+           cands = variant_candidates(apex, brand, suffix, discovered)
+       
+           # DNS first, HTTP second. Resolving the whole candidate list is cheap and
+           # asks nothing of the company's web servers; without this gate a sweep would
+           # fire dozens of requests at hosts that mostly do not exist.
+           with ThreadPoolExecutor(max_workers=8) as ex:
+               live = list(ex.map(lambda c: (c, resolves(c["host"])), cands))
+           reachable = [c for c, ok in live if ok]
+           skipped = [c for c, ok in live if not ok]
+       
+           # The base site's own IDs: a variant reusing one of these is the same company.
+           base_ids = sorted(base_containers | set(base_raw.get("gtag") or {}))
+           workers = max(1, min(workers, MAX_WORKERS))
+           with ThreadPoolExecutor(max_workers=workers) as ex:
+               probes = list(ex.map(lambda c: probe_variant(c, apex, brand, base_ids), reachable))
+       
+           confirmed = [p for p in probes if p["same_company"]]
+           unconfirmed = [p for p in probes if not p["same_company"] and p["served_a_page"]]
+           unreachable = [p for p in probes if not p["same_company"] and not p["served_a_page"]]
+       
+           # Only confirmed variants' containers are fetched and counted. An unrelated
+           # owner's container is not this company's measurement setup.
+           new_ids = sorted({g for p in confirmed for g in p["containers"]} - base_containers)
+           parsed = {}
+           if do_containers and new_ids:
+               def grab(gid):
+                   try:
+                       return gid, analyse_container(gid)
+                   except Exception as e:
+                       return gid, {"error": f"{type(e).__name__}: {str(e)[:140]}"}
+               with ThreadPoolExecutor(max_workers=min(3, len(new_ids))) as ex:
+                   parsed = dict(ex.map(grab, new_ids))
+       
+           for p in probes:
+               p["new_containers"] = [g for g in p["containers"] if g in new_ids]
+               if not p["served_a_page"]:
+                   p["verdict"] = ("unreachable (connection or TLS failure)" if not p["status"]
+                                   else f"HTTP {p['status']}, nothing served")
+               elif not p["same_company"]:
+                   p["verdict"] = "UNCONFIRMED owner -- not counted"
+               elif p["new_containers"]:
+                   p["verdict"] = "DIFFERENT container"
+               elif p["redirects_into_base"] and not p["containers"]:
+                   p["verdict"] = "redirects into the base host"
+               elif p["containers"]:
+                   p["verdict"] = ("same container as base"
+                                   if set(p["containers"]) <= base_containers else "mixed")
+               else:
+                   p["verdict"] = "theirs, but no container in the served HTML"
+       
+           # What the single-site read would have missed, stated as the delta rather
+           # than as another inventory.
+           roll_new = _container_rollup({g: c for g, c in parsed.items() if isinstance(c, dict)})
+           delta = {
+               "new_containers": new_ids,
+               "new_conversion_actions": sorted(set(roll_new["conversion_actions"])
+                                                - set(base["conversion_action_labels"])),
+               "new_ga4_events": sorted(set(roll_new["ga4_events"])
+                                        - set(base["ga4_event_names"])),
+               "new_ads_accounts": sorted(set(roll_new["ads_accounts"])
+                                          - set(base["ads_account_ids"])),
+               "new_tags": roll_new["tags"],
+           }
+       
+           # Variant profiles so the same cross-target statistics apply within one
+           # company: a regional container with a tenth of the tags is the finding.
+           profiles = [base]
+           for p in confirmed:
+               if not p["containers"]:
+                   continue
+               own = {g: parsed[g] for g in p["containers"] if isinstance(parsed.get(g), dict)}
+               if not own:
+                   continue
+               roll = _container_rollup(own)
+               profiles.append({
+                   "label": p["host"], "ok": True, "depth": "one page + its containers",
+                   "containers": p["containers"], "per_container_tags": roll["per_container_tags"],
+                   "vendors": p["vendors"], "ga4_event_names": roll["ga4_events"],
+                   "conversion_action_labels": roll["conversion_actions"],
+                   "ads_account_ids": roll["ads_accounts"], "notes": [],
+                   "metrics": {
+                       "containers": len(p["containers"]),
+                       "tags": roll["tags"] or None,
+                       "ga4_events": len(roll["ga4_events"]) or None,
+                       "ads_accounts": len(roll["ads_accounts"]) or None,
+                       "conversion_actions": len(roll["conversion_actions"]) or None,
+                       "consent_share_pct": roll["consent_share_pct"],
+                       "vendors": len(p["vendors"]),
+                       "lookup_tables": roll["lookup_tables"] or None,
+                       "sitemap_urls": None,
+                   },
+               })
+       
+           return {
+               "mode": "regional",
+               "base": base,
+               "apex": apex, "brand": brand,
+               "candidates_tested": len(cands),
+               "candidates_not_resolving": [c["host"] for c in skipped],
+               "variants": sorted(probes, key=lambda p: (p["verdict"] != "DIFFERENT container", p["host"])),
+               "unconfirmed_owner": sorted(p["host"] for p in unconfirmed),
+               "unreachable": sorted(p["host"] for p in unreachable),
+               "new_containers_parsed": parsed,
+               "delta_vs_single_site": delta,
+               "profiles": profiles,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # rendering
+       # ---------------------------------------------------------------------------
+       
+    1: def render_stats(profiles, stats, outliers, kind_label="targets"):
+    1:     L, a = [], None
+    1:     a = L.append
+    3:     ok = [p for p in profiles if p.get("ok")]
+       
+           # One survivor is not a comparison. Say that once, rather than describing a
+           # single site as mid-pack against itself.
+    1:     if len(ok) < 2:
+               a(f"\n## No comparison possible")
+               a(f"  {len(ok)} of {len(profiles)} {kind_label} produced comparable measurements, so")
+               a("  there is nothing to read any number against. Fix or replace the failures")
+               a("  listed below and re-run; a single profile is what recon.py already prints.")
+               return L
+       
+    3:     ranked = sorted(stats.values(), key=lambda s: -s["spread"])
+    3:     moving = [s for s in ranked if s["max"] != s["min"]]
+    3:     flat = [s for s in ranked if s["max"] == s["min"]]
+       
+    1:     a(f"\n## What separates these {kind_label}  (widest spread first)")
+    1:     if not moving:
+               a("  Nothing measured here separates them. Either the set is genuinely alike")
+               a("  or the collection was too shallow -- check the gaps below.")
+    2:     for s in moving:
+    1:         a(f"\n  {s['label']}")
+    1:         a(f"    high  {fmt(s['max'], s['kind']):>8}   {', '.join(s['holders_max'])}")
+    1:         a(f"    low   {fmt(s['min'], s['kind']):>8}   {', '.join(s['holders_min'])}")
+    1:         a(f"    middle {fmt(s['median'], s['kind']):>7}   (median of {s['n']})")
+    1:     if flat:
+    2:         a("\n  Identical across the set, so they differentiate nothing here: "
+    3:           + ", ".join(s["label"] for s in flat))
+       
+    1:     a(f"\n## Where each one sits against the set")
+    3:     for p in ok:
+    2:         rows = outliers.get(p["label"], [])
+    2:         if rows:
+    4:             bits = [f"{side} {s['short']} ({fmt(s['values'][p['label']], s['kind'])})"
+    6:                     for side, _, s in rows[:4]]
+    2:             a(f"  {p['label']:<26} {'; '.join(bits)}")
+               else:
+                   a(f"  {p['label']:<26} no extreme on any measurement -- mid-pack throughout")
+       
+    1:     a("\n## Reading a single number against the set")
+    1:     a("  (what a one-site report cannot tell you)")
+    5:     for key, s in sorted(stats.items(), key=lambda kv: -kv[1]["spread"])[:4]:
+    6:         for p in ok:
+    4:             v = s["values"].get(p["label"])
+    4:             if v is None:
+                       continue
+    4:             if v == s["max"] and s["max"] != s["min"]:
+    1:                 rel = "the top of this set"
+    3:             elif v == s["min"] and s["max"] != s["min"]:
+    1:                 rel = "the bottom of this set"
+    2:             elif s["median"] and v > s["median"]:
+                       rel = f"above the middle ({fmt(s['median'], s['kind'])})"
+    2:             elif s["median"] and v < s["median"]:
+                       rel = f"below the middle ({fmt(s['median'], s['kind'])})"
+                   else:
+    2:                 rel = "the middle value itself"
+    4:             a(f"  {p['label']:<26} {fmt(v, s['kind']):>8}  {s['label']:<38} {rel}")
+    2:         a("")
+       
+    1:     if len(ok) < MIN_FOR_STATS:
+    2:         a(f"  !! {len(ok)} comparable {kind_label} "
+    1:           f"{'is' if len(ok) == 1 else 'are'} too few for the median to be a benchmark.")
+    1:         a("     With two or three, the median is simply one of the numbers in the set, and")
+    1:         a("     'above the middle' means 'above one other site'. Treat the high/low names as")
+    1:         a(f"     the real output here; add targets up to {MIN_FOR_STATS}-6 before calling any of")
+    1:         a("     this a baseline.")
+    1:     return L
+       
+       
+    1: def render_compare(res):
+    1:     L, a = [], None
+    1:     a = L.append
+    1:     profiles = res["profiles"]
+    3:     ok = [p for p in profiles if p.get("ok")]
+    1:     stats, outliers = res["stats"], res["outliers"]
+    1:     skipped_containers = not res["containers_parsed"]
+       
+    4:     a(f"# Multi-target comparison: {', '.join(p['label'] for p in profiles)}")
+    2:     a(f"{len(ok)} of {len(profiles)} collected; "
+    1:       f"{'containers parsed' if res['containers_parsed'] else 'containers SKIPPED (--fast)'}")
+       
+    3:     for p in profiles:
+    2:         if p.get("identity_warning"):
+                   a("")
+                   a(f"!! {p['label']}: {p['identity_warning']}")
+       
+    1:     L += render_stats(profiles, stats, outliers, "targets")
+       
+    1:     v = res["vendors"]
+    1:     if len(ok) < 2:
+               return "\n".join(L + ["", "## Gaps"] +
+                                 [f"  - {p['label']}: {p.get('gap')}" for p in profiles
+                                  if not p.get("ok")])
+    1:     a("\n## Stack: shared versus chosen")
+    1:     a(f"  loaded by all {len(ok)} ({len(v['common'])}) -- table stakes, not a differentiator:")
+    1:     a("    " + (", ".join(v["common"]) or "none"))
+    1:     if v.get("contested"):
+               a(f"\n  some but not all ({len(v['contested'])}) -- the contested choices:")
+               a("    " + ", ".join(v["contested"]))
+    1:     a("\n  unique to one target -- the deliberate bets:")
+    3:     for name, only in v["unique"].items():
+    2:         a(f"    {name:<26} {', '.join(only) if only else 'nothing of its own'}")
+       
+    1:     a("\n## Funnel vocabulary")
+    1:     a("  (event names are written by whoever owns the funnel, so shared names mean a")
+    1:     a("   shared playbook and unique ones mean a stage the others do not measure)")
+    3:     namesets = {p["label"]: set(p["ga4_event_names"]) for p in ok if p["ga4_event_names"]}
+    1:     if len(namesets) >= 2:
+               shared = set.intersection(*namesets.values())
+               a(f"  named by all {len(namesets)} targets with a parsed container: "
+                 f"{', '.join(sorted(shared)[:25]) or 'nothing in common'}")
+               for name, names in namesets.items():
+                   others = set.union(*[x for k, x in namesets.items() if k != name])
+                   only = sorted(names - others)
+                   a(f"  only {name}: {', '.join(only[:18]) or 'nothing of its own'}"
+                     + (f"  (+{len(only) - 18} more)" if len(only) > 18 else ""))
+               runtime = {p["label"]: p.get("ga4_runtime_named_events", 0) for p in ok
+                          if p.get("ga4_runtime_named_events")}
+               if runtime:
+                   a("  events whose name is built at runtime, so there is no name to compare: "
+                     + ", ".join(f"{k} {v}" for k, v in runtime.items()))
+           else:
+    1:         a("  fewer than two targets have a parsed container with named GA4 events, so")
+    1:         a("  there is no vocabulary to compare.")
+       
+    1:     a("\n## Per-target inventory")
+    3:     for p in profiles:
+    2:         if not p.get("ok"):
+                   a(f"\n  {p['label']}  -- GAP: {p.get('gap')}")
+                   continue
+    2:         m = p["metrics"]
+    2:         a(f"\n  {p['label']}  ({p['depth']}, HTTP {p.get('http_status')})")
+    6:         cont = ", ".join(f"{g} ({t:,} tags)" if isinstance(t, int) else f"{g} (not parsed)"
+    4:                          for g, t in (p.get("per_container_tags") or {}).items())
+    2:         a(f"    containers: {cont or 'none found'}")
+    2:         if p.get("tags_without_a_container"):
+                   a(f"    no GTM container: tags directly with "
+                     f"{', '.join(p.get('google_tags_in_html') or [])}")
+    4:         a(f"    ga4 events {fmt(m['ga4_events'], 'count')}   "
+    2:           f"ads accounts {fmt(m['ads_accounts'], 'count')}   "
+    2:           f"conversion actions {fmt(m['conversion_actions'], 'count')}   "
+    2:           f"lookup tables {fmt(m['lookup_tables'], 'count')}")
+    4:         a(f"    consent-declaring tags {fmt(m['consent_share_pct'], 'pct')}   "
+    2:           f"vendors {fmt(m['vendors'], 'count')}   "
+    2:           f"sitemap {fmt(m['sitemap_urls'], 'count')} URLs")
+    2:         if p.get("ads_account_ids"):
+                   a(f"    ads accounts: {', '.join(p['ads_account_ids'])}")
+    2:         if p.get("sibling_hosts"):
+                   a(f"    other hosts on this domain: {', '.join(p['sibling_hosts'][:8])}")
+       
+    3:     gaps = [p for p in profiles if not p.get("ok")]
+    1:     a("\n## Gaps and caveats")
+    1:     if skipped_containers:
+    1:         a("  - --fast: containers were not parsed, so tags, GA4 events, conversion actions,")
+    1:         a("    consent share and lookup tables are missing for every target. Those are the")
+    1:         a("    measurements worth comparing; re-run without --fast before concluding anything.")
+    1:     for p in gaps:
+               a(f"  - {p['label']}: {p.get('gap')}. Counted as missing, not as zero.")
+    3:     for p in ok:
+    2:         if p.get("tags_without_a_container"):
+                   a(f"  - {p['label']} serves no GTM container and tags directly instead, so its")
+                   a("    container measurements are absent by architecture rather than by failure.")
+                   a("    Its tag count is not comparable to a container-based target's, and its")
+                   a("    conversion setup is only visible where the gtag snippet names it.")
+    3:     for p in ok:
+               # No container means no container measurements, and the architecture note
+               # just above already said why. Repeating the list adds nothing.
+   52:         m_none = [k for k, _, _, _ in METRICS
+   18:                   if p["metrics"].get(k) is None
+   13:                   and not (skipped_containers and k in CONTAINER_METRICS)
+    1:                   and not (p.get("tags_without_a_container") and k in CONTAINER_METRICS)]
+    2:         if m_none:
+    1:             a(f"  - {p['label']}: no value for {', '.join(m_none)}.")
+    1:     a("  - Each target was read at one page scope (plus any --pages). A site serving")
+    1:     a("    separate containers for its app or checkout can look thinner than it is;")
+    1:     a("    --regional on a single target is the way to test that.")
+    1:     a("  - Conversion actions are distinct Ads labels, not AW- accounts, and a label")
+    1:     a("    present in a container is not proof the account behind it still spends.")
+    1:     a("  - Tag counts measure configuration, not sophistication: a 400-tag container")
+    1:     a("    can be years of unremoved debt and a 60-tag one a deliberate rebuild.")
+    1:     return "\n".join(L)
+       
+       
+    1: def render_regional(res):
+           L, a = [], None
+           a = L.append
+           base, delta = res["base"], res["delta_vs_single_site"]
+           variants = res["variants"]
+           diff = [v for v in variants if v["verdict"] == "DIFFERENT container"]
+       
+           a(f"# Regional and functional variant sweep: {res['apex']}")
+           a(f"base read: {', '.join(base['containers']) or 'no container'}"
+             f"  ({fmt(base['metrics']['tags'], 'count')} tags, "
+             f"{fmt(base['metrics']['conversion_actions'], 'count')} conversion actions)")
+           a(f"{res['candidates_tested']} candidate hosts, "
+             f"{len(variants)} resolved and were fetched once each, "
+             f"{len(res['candidates_not_resolving'])} do not exist and were never requested")
+           if res.get("unconfirmed_owner"):
+               a(f"{len(res['unconfirmed_owner'])} served a page with no tie to this company and are"
+                 f" excluded from every count below")
+           if res.get("unreachable"):
+               a(f"{len(res['unreachable'])} resolved but served nothing (parked, blocked or dead)")
+       
+           a("\n## Variants serving a container the base site does not")
+           if not diff:
+               a("  None. Every reachable variant serves the same container(s) as the base site,")
+               a("  so the single-site read was already the whole picture for this company.")
+           for v in diff:
+               a(f"\n  {v['host']}  [{v['why']}]")
+               a(f"    new containers: {', '.join(v['new_containers'])}")
+               for g in v["new_containers"]:
+                   c = res["new_containers_parsed"].get(g)
+                   if isinstance(c, dict) and not c.get("error"):
+                       gs = c.get("google_ads_summary") or {}
+                       a(f"      {g}: {(c.get('counts') or {}).get('tags', 0):,} tags, "
+                         f"{len(c.get('ga4_events') or [])} GA4 events, "
+                         f"{len(gs.get('labels') or [])} conversion actions, "
+                         f"{len(c.get('lookup_tables') or [])} lookup tables")
+                   elif isinstance(c, dict):
+                       a(f"      {g}: not parsed -- {c.get('error')}")
+               a(f"    tied to the company by: {'; '.join(v['same_company_evidence'])}")
+               if v.get("title"):
+                   a(f"    title: {v['title']}")
+       
+           a("\n## What the single-site read missed")
+           if delta["new_containers"]:
+               a(f"  containers:         +{len(delta['new_containers'])}  "
+                 f"({', '.join(delta['new_containers'])})")
+               a(f"  tags:               +{delta['new_tags']:,} in those containers")
+               a(f"  conversion actions: +{len(delta['new_conversion_actions'])}"
+                 + (f"  ({', '.join(delta['new_conversion_actions'][:6])}"
+                    + (" ..." if len(delta["new_conversion_actions"]) > 6 else "") + ")"
+                    if delta["new_conversion_actions"] else ""))
+               a(f"  ads accounts:       +{len(delta['new_ads_accounts'])}"
+                 + (f"  ({', '.join(delta['new_ads_accounts'])})" if delta["new_ads_accounts"] else ""))
+               a(f"  GA4 event names:    +{len(delta['new_ga4_events'])}"
+                 + (f"  ({', '.join(delta['new_ga4_events'][:12])}"
+                    + (" ..." if len(delta["new_ga4_events"]) > 12 else "") + ")"
+                    if delta["new_ga4_events"] else ""))
+               a("")
+               if delta["new_conversion_actions"] or delta["new_ads_accounts"]:
+                   a("  Those conversion actions and ad accounts are ones the homepage container")
+                   a("  never names, which is the point of the sweep: the stage that actually")
+                   a("  converts often lives on a host the marketing site never loads.")
+               else:
+                   a("  The extra containers reuse the same conversion actions and ad accounts as the")
+                   a("  base container, so the optimisation surface is unchanged -- what the sweep")
+                   a("  found is extra measurement, not extra bidding. Worth knowing either way: a")
+                   a("  separate container is a separate place a tag can be changed or broken.")
+           else:
+               a("  Nothing. No variant added a container, so nothing here changes the base read.")
+       
+           if res.get("unconfirmed_owner"):
+               a(f"\n## Resolving hosts with no tie to this company ({len(res['unconfirmed_owner'])})")
+               a("  (a brand's ccTLD is frequently somebody else's business, and a stranger's")
+               a("   container counted as this company's would be a badly wrong finding)")
+               for v in variants:
+                   if v["same_company"] or not v["served_a_page"]:
+                       continue
+                   land = (f"  -> {v['final_host']}"
+                           if v["final_host"] and v["final_host"] != v["host"] else "")
+                   a(f"  {v['host']}{land}")
+                   if v.get("title"):
+                       a(f"      \"{v['title']}\"")
+                   if v["containers"]:
+                       a(f"      serves {', '.join(v['containers'])} -- somebody else's container,"
+                         f" not counted")
+               a("  Checked for: a page reference to the base domain, a redirect into it, or a")
+               a("  shared container/measurement ID. None of these showed any. If one of them is")
+               a("  in fact theirs, confirm it by hand and re-read that host on its own.")
+       
+           a("\n## Every variant that resolved")
+           for v in variants:
+               a(f"  {v['host']:<34} {v['verdict']:<36} "
+                 f"{', '.join(v['containers']) or '-'}")
+               if v["final_host"] and v["final_host"] != v["host"]:
+                   a(f"  {'':<34} -> landed on {v['final_host']}")
+       
+           if res.get("unreachable"):
+               a(f"\n## Resolving but served no page ({len(res['unreachable'])})")
+               a("  (DNS records with nothing behind them: parked, blocked, or dead. Not evidence")
+               a("   of a market, and not evidence against one either)")
+               a("  " + ", ".join(res["unreachable"]))
+       
+           if res["candidates_not_resolving"]:
+               a(f"\n## Candidates that do not resolve ({len(res['candidates_not_resolving'])})")
+               a("  (DNS only -- no request was sent to any of these)")
+               a("  " + ", ".join(res["candidates_not_resolving"]))
+       
+           profiles = res["profiles"]
+           if len([p for p in profiles if p.get("ok")]) >= 2:
+               stats = stat_block(profiles)
+               L += render_stats(profiles, stats, outlier_summary(profiles, stats), "variants")
+       
+           a("\n## Caveats")
+           a("  - Each variant got one homepage request, not a full collection, so a variant's")
+           a("    own extra pages may carry containers this sweep did not see.")
+           a("  - A variant serving the same container still behaves differently at runtime:")
+           a("    the container's own region conditions decide what fires where.")
+           a("  - A resolving ccTLD is not proof of a live market. Some are defensive")
+           a("    registrations that redirect, and some belong to an unrelated company.")
+           a("  - A variant tied to the company only by 'its page references the base domain'")
+           a("    may be a reseller, partner or affiliate rather than the company's own site.")
+           a("    A redirect into the base host or a shared container ID is the firmer tie;")
+           a("    check the evidence line before counting a page-reference-only variant.")
+           return "\n".join(L)
+       
+       
+       # ---------------------------------------------------------------------------
+       # cli
+       # ---------------------------------------------------------------------------
+       
+    1: def run_compare(targets, pages=(), do_containers=True, workers=DEFAULT_WORKERS):
+    1:     profiles = collect_many(targets, pages, do_containers, workers)
+    1:     stats = stat_block(profiles)
+    1:     return {
+    1:         "mode": "compare",
+    1:         "containers_parsed": do_containers,
+    1:         "profiles": profiles,
+    1:         "stats": stats,
+    1:         "outliers": outlier_summary(profiles, stats),
+    1:         "vendors": vendor_sets(profiles),
+           }
+       
+       
+    1: def main():
+           # An explicit --help is a request that succeeded, so it exits 0. Running with
+           # no arguments at all is a usage error and still exits 1.
+    1:     if "--help" in sys.argv or "-h" in sys.argv:
+               print(__doc__)
+               return 0
+    1:     argv = sys.argv[1:]
+    1:     if not argv or "--help" in argv or "-h" in argv:
+               print(__doc__)
+               return 1
+       
+    1:     pages, out_json, workers = [], None, DEFAULT_WORKERS
+    1:     regional = "--regional" in argv
+    1:     do_containers = "--fast" not in argv and "--no-containers" not in argv
+       
+    1:     def opt(flag, default=None):
+    2:         if flag in argv:
+                   i = argv.index(flag)
+                   if len(argv) > i + 1 and not argv[i + 1].startswith("--"):
+                       return argv[i + 1]
+    2:         return default
+       
+    1:     if (v := opt("--pages")):
+               pages = [p.strip() for p in v.split(",") if p.strip()]
+    1:     if "--json" in argv:
+               out_json = opt("--json", "compare.json")
+    1:     if (v := opt("--workers")):
+               try:
+                   workers = int(v)
+               except ValueError:
+                   pass
+       
+    1:     consumed = {"--regional", "--fast", "--no-containers", "--json", "--pages", "--workers"}
+    1:     targets, skip = [], False
+    4:     for tok in argv:
+    3:         if skip:
+                   skip = False
+                   continue
+    3:         if tok.startswith("--"):
+    1:             skip = tok in {"--json", "--pages", "--workers"}
+    1:             if tok not in consumed:
+                       print(f"unknown flag {tok}", file=sys.stderr)
+                       return 1
+    1:             continue
+    2:         targets.append(tok)
+           # Dedupe while keeping order: comparing a target against itself produces a
+           # spread of zero and reads as "these sites are identical".
+    1:     targets = list(dict.fromkeys(targets))
+       
+    1:     if not targets:
+               print("give at least one target", file=sys.stderr)
+               return 1
+       
+    1:     if regional:
+               if len(targets) != 1:
+                   print("--regional sweeps one company; pass exactly one target", file=sys.stderr)
+                   return 1
+               res = sweep_regional(targets[0], pages, do_containers, workers)
+               print(render_regional(res))
+           else:
+    1:         if len(targets) < 2:
+                   print("comparison needs at least two targets (or use --regional for one "
+                         "company's variants)", file=sys.stderr)
+                   return 1
+    1:         res = run_compare(targets, pages, do_containers, workers)
+    1:         print(render_compare(res))
+       
+    1:     if out_json:
+               with open(out_json, "w", encoding="utf-8") as fh:
+                   json.dump(res, fh, indent=2, default=str)
+               print(f"\n[raw comparison written to {out_json}]")
+    1:     return 0
+       
+       
+    1: if __name__ == "__main__":
+    1:     sys.exit(main())

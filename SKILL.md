@@ -109,7 +109,12 @@ Five more scripts cover ground the collector does not. They are described under
 | `report_pdf.py` | turns the finished report into a designed PDF |
 
 All of them are stdlib-only and fall back to `curl` when Python's CA store is
-broken, which is common. If a container 404s or Google rate-limits, retry once,
+broken, which is common. They need Python 3.9 or newer, which macOS and Linux
+ship but Windows does not.
+
+If `python3` is missing, say so once and carry on without it. The scripts make
+this faster; they are not the method. Every file they read is one you can fetch
+and inspect directly, so the workflow below still holds, it just takes longer. If a container 404s or Google rate-limits, retry once,
 then note it as a gap rather than guessing at the contents.
 
 Two things to check in the collector's output before you read anything else,
