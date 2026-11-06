@@ -106,6 +106,7 @@ Five more scripts cover ground the collector does not. They are described under
 | `company.py` | who they are hiring, what they ship, what they file |
 | `history.py` | what their measurement looked like before |
 | `compare.py` | whether a number is normal for their market |
+| `report_pdf.py` | turns the finished report into a designed PDF |
 
 All of them are stdlib-only and fall back to `curl` when Python's CA store is
 broken, which is common. If a container 404s or Google rate-limits, retry once,
@@ -291,6 +292,25 @@ them through conversion labels to reach the point has failed them. Write it last
 and strip the jargon out deliberately — it is easy to skip and it is the section
 that does the most work.
 
+**Deliver a PDF, not a markdown file.** Markdown is the working format; it is
+not what someone opens in a meeting or forwards to a client. Write the report as
+markdown, then render it:
+
+```bash
+python3 -I scripts/report_pdf.py acme-recon.md
+```
+
+That produces a designed document with a cover page, page numbers, and the
+confidence markers set as coloured chips so a reader can see at a glance which
+sentences are evidence and which are interpretation. Images referenced in the
+report are embedded, so the PDF is a single self-contained file that survives
+being emailed. Hand over the PDF and say where the markdown is, in case they
+want to edit it.
+
+It needs a Chrome, Chromium, Edge or Brave binary, which it finds on its own. If
+there is none it still writes the styled HTML and says so — an HTML file someone
+can open and print is a usable deliverable, so do not treat that as a failure.
+
 Mark every substantive claim:
 
 - **Observed** — it is in the file; quote or cite the field.
@@ -396,6 +416,7 @@ Not every request needs the full report. Match the output to the ask:
 - "What are they hiring for" -> `company.py` alone.
 - "What changed this year" -> `history.py --diff` alone.
 - "How do they compare to X and Y" -> `compare.py`, which needs no prose at all.
+- A one-line answer needs no PDF. Render one when there is a report to hand over.
 
 Still run the collector even for small asks: it is one command, and it stops you
 guessing at something the file states outright. The deeper passes are the

@@ -146,6 +146,9 @@ python3 -I scripts/history.py GTM-XXXXXXX --diff
 # Benchmark several companies, or sweep one company's variants
 python3 -I scripts/compare.py a.com b.com c.com
 python3 -I scripts/compare.py --regional example.com
+
+# Render a finished report as a designed PDF
+python3 -I scripts/report_pdf.py acme-recon.md
 ```
 
 | Argument | Purpose |
@@ -218,6 +221,18 @@ Five further modules answer what a container cannot. Each runs standalone, and n
 
 > [!TIP]
 > The gating conditions are usually the fastest route to something actionable. A condition applied to seven ad-platform tags is a policy decision, not a configuration detail — and the platforms *missing* from that condition are often more interesting than the ones subject to it.
+
+<br>
+
+## The deliverable
+
+Reports are written as markdown and rendered to a PDF with a cover page, page numbers and embedded images — a single self-contained file, not a folder of loose assets.
+
+```bash
+python3 -I scripts/report_pdf.py acme-recon.md
+```
+
+The confidence markers become coloured chips, so a reader can see at a glance which sentences are evidence and which are interpretation. Rendering uses a headless Chrome, Chromium, Edge or Brave, found automatically; set `CHROME_BIN` to point at a specific one. With no browser available it writes the styled HTML instead and says so, which is still something you can open and print.
 
 <br>
 
@@ -303,6 +318,7 @@ Bid-level questions are answered by auction insights and public ad libraries, no
 | `scripts/company.py` | Hiring, mobile apps, public filings |
 | `scripts/history.py` | Archived container snapshots and diffs |
 | `scripts/compare.py` | Multi-target benchmarking and variant sweeps |
+| `scripts/report_pdf.py` | Renders a finished report to a designed PDF |
 | `references/` | Field map, endpoint catalogue, vendor meanings, runtime method, report template |
 
 No build step, no lockfile, no dependencies.
@@ -311,7 +327,7 @@ No build step, no lockfile, no dependencies.
 
 ## Requirements
 
-Python 3.8 or newer, standard library only — there is nothing to install with pip. Node is needed only for the install command. `curl` is used as a fallback when Python's certificate store is unconfigured, which is common on macOS.
+Python 3.8 or newer, standard library only — there is nothing to install with pip. Node is needed only for the install command, and a Chromium-family browser only if you want PDF output. `curl` is used as a fallback when Python's certificate store is unconfigured, which is common on macOS.
 
 <br>
 

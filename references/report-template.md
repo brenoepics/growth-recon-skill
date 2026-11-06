@@ -3,6 +3,11 @@
 Use this structure. Adapt the depth to the request — a "what's their pixel ID"
 question gets a few lines, not this whole thing.
 
+The finished report is rendered to PDF with `scripts/report_pdf.py`, so write
+plain markdown and let the renderer handle presentation. Two things it keys off:
+the `# ` title line (the template's "Growth recon: Acme (https://acme.com)" form
+becomes the cover) and the confidence markers, which become coloured chips.
+
 Two rules that do most of the work:
 
 **Lead with the read, not the inventory.** The reader can scroll to the ID
