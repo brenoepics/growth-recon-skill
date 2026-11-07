@@ -116,6 +116,9 @@ You get back two things:
 - **Optionally an MP4**, if you would rather send a video than a link. Needs
   ffmpeg.
 
+Reports can be written in any language. The deck reads the language from the
+text and translates its own labels, or you can set it with `--lang pt`.
+
 Send the deck to a client or put it on a screen. Keep the write-up for whoever
 wants the whole thing.
 

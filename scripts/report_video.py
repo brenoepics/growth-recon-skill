@@ -151,7 +151,8 @@ def main():
     with open(src, encoding="utf-8", errors="replace") as fh:
         md = fh.read()
     base_dir = os.path.dirname(os.path.abspath(src))
-    page = build_html(md, base_dir, title=opt("--title"), subtitle=opt("--subtitle"))
+    page = build_html(md, base_dir, title=opt("--title"), subtitle=opt("--subtitle"),
+                      lang=opt("--lang"))
 
     html_path = os.path.splitext(out)[0] + ".deck.html"
     with open(html_path, "w", encoding="utf-8") as fh:

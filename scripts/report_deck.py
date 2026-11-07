@@ -10,6 +10,7 @@ Usage:
     python3 -I scripts/report_deck.py report.md -o acme.html
     python3 -I scripts/report_deck.py report.md --pdf      # also print it
     python3 -I scripts/report_deck.py report.md --subtitle "Prepared for ..."
+    python3 -I scripts/report_deck.py report.md --lang pt   # pt-BR interface
 
 Output is ONE html file with the CSS, the JavaScript and every image inlined.
 No build step, no npm install, no CDN, nothing to serve. It opens from a double
@@ -157,8 +158,38 @@ def find_browser():
 # chip rule never sees it, which is exactly how the first build shipped them as
 # grey monospace instead of coloured badges.
 CONFIDENCE_RE = re.compile(
-    r"`?\[(observed|inferred|speculative)([^\]]{0,48})\]`?", re.I)
-CONF_CLASS = {"observed": "obs", "inferred": "inf", "speculative": "spec"}
+    r"`?\[(observed|inferred|speculative|observado|inferido|especulativo)"
+    r"([^\]]{0,48})\]`?", re.I)
+CONF_CLASS = {"observed": "obs", "inferred": "inf", "speculative": "spec",
+              "observado": "obs", "inferido": "inf", "especulativo": "spec"}
+
+# Interface strings. A report about a Brazilian company should not be framed in
+# English furniture, so the chrome follows the language the report is written in.
+UI = {
+    "en": {"why": "Why this matters", "more": "more below \\2193",
+           "hint": 'Use <kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move, '
+                   '<kbd>O</kbd> for all slides',
+           "eyebrow": "Growth recon", "lang": "en",
+           "note": ("Built only from public files, the ones this website sends to "
+                    "anyone who visits it. Nothing here needed a login.")},
+    "pt": {"why": "Por que isso importa", "more": "continua abaixo \\2193",
+           "hint": 'Use <kbd>&larr;</kbd> <kbd>&rarr;</kbd> para navegar, '
+                   '<kbd>O</kbd> para ver todos os slides',
+           "eyebrow": "Análise de crescimento", "lang": "pt-BR",
+           "note": ("Feito apenas com arquivos públicos, os mesmos que este site "
+                    "envia para qualquer pessoa que o visita. Nada aqui exigiu login.")},
+}
+
+# A few words that are common in Portuguese and rare in English. Enough to pick
+# the right furniture without asking, and --lang overrides it either way.
+PT_HINTS = re.compile(
+    r"\b(não|são|está|também|para|como|mais|isso|eles|elas|que|uma|dos|das|"
+    r"pele|preço|vendas|público|anúncios|marca)\b", re.I)
+
+
+def detect_lang(md):
+    hits = len(PT_HINTS.findall(md))
+    return "pt" if hits >= 12 else "en"
 
 
 def embed_image(src, base_dir):
@@ -567,7 +598,7 @@ figcaption{font-size:.84rem;color:var(--muted);margin-top:.5rem}
 .js-deck .slide.more.active ~ .hint{opacity:0}
 .hint kbd{background:rgba(255,255,255,.14);border-radius:5px;padding:.1em .45em;
           font-family:inherit;font-size:.9em}
-.slide.more::after{content:"more below \\2193";position:absolute;left:50%;bottom:3.2rem;
+.slide.more::after{content:"{more}";position:absolute;left:50%;bottom:3.2rem;
   transform:translateX(-50%);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
   color:var(--muted);background:rgba(255,255,255,.92);border:1px solid var(--rule);
   border-radius:20px;padding:.25rem .7rem;pointer-events:none}
@@ -638,12 +669,30 @@ DECK_JS = r"""
     var raw = el.getAttribute('data-v') || el.textContent || '';
     var m = raw.match(/^([^\d\-]*)(-?[\d.,]+)(.*)$/);
     if (!m || reduce) { el.textContent = raw; return; }
-    var pre = m[1], post = m[3];
-    var clean = m[2].replace(/,/g, '');
+    var pre = m[1], post = m[3], num = m[2];
+
+    // A comma means different things in different places. "22,90" is twenty-two
+    // and ninety centavos in Brazil, while "1,200" is one thousand two hundred
+    // in English. Reading the first as a thousands separator made the tile
+    // count toward 2290 before snapping back to the real figure, which is the
+    // flash of a wrong number that this counter is supposed to avoid.
+    var clean, dec;
+    if (/^\d{1,3}(\.\d{3})*,\d+$/.test(num) || /^\d+,\d{1,2}$/.test(num)) {
+      clean = num.replace(/\./g, '').replace(',', '.');   // comma is the decimal
+      dec = clean.split('.')[1].length;
+    } else {
+      clean = num.replace(/,/g, '');                      // comma groups thousands
+      dec = (clean.split('.')[1] || '').length;
+    }
     var target = parseFloat(clean);
     if (isNaN(target)) { el.textContent = raw; return; }
 
-    var dec = (clean.split('.')[1] || '').length;
+    // Count in the same notation the figure was written in.
+    var comma = clean !== num.replace(/,/g, '');
+    function fmt(v){
+      var t = v.toFixed(dec);
+      return comma ? t.replace('.', ',') : t;
+    }
     var dur = 760;
     var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
     var done = false;
@@ -662,10 +711,10 @@ DECK_JS = r"""
       var p = Math.min((now - t0) / dur, 1);
       if (p >= 1) { finish(); return; }
       var eased = 1 - Math.pow(1 - p, 3);
-      el.textContent = pre + (target * eased).toFixed(dec) + post;
+      el.textContent = pre + fmt(target * eased) + post;
       requestAnimationFrame(step);
     }
-    el.textContent = pre + (0).toFixed(dec) + post;
+    el.textContent = pre + fmt(0) + post;
     requestAnimationFrame(step);
   }
 
@@ -765,7 +814,7 @@ DECK_JS = r"""
 """
 
 DECK_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="{lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <style>{css}</style>
@@ -774,7 +823,7 @@ DECK_PAGE = """<!doctype html>
 <div class="deck">{slides}</div>
 <div class="nav"><div></div><div></div></div>
 <div class="count"></div>
-<div class="hint">Use <kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move, <kbd>O</kbd> for all slides</div>
+<div class="hint">{hint}</div>
 <div class="grid"></div>
 <script>{js}</script>
 </body></html>
@@ -818,7 +867,7 @@ def split_slides(md):
     return parts
 
 
-def render_slide(md, base_dir):
+def render_slide(md, base_dir, ui):
     """One slide: heading, optional explainer band, optional stat tiles, body."""
     lines = md.split("\n")
     head = ""
@@ -838,8 +887,8 @@ def render_slide(md, base_dir):
             j += 1
         text = " ".join(q.strip() for q in quote).strip()
         if text and not text.startswith("[!"):
-            why = ('<div class="why"><b>Why this matters</b><span>'
-                   + inline(text, base_dir) + "</span></div>")
+            why = ('<div class="why"><b>' + html_mod.escape(ui["why"])
+                   + "</b><span>" + inline(text, base_dir) + "</span></div>")
             lines = lines[j:]
 
     body_md = "\n".join(lines)
@@ -857,7 +906,9 @@ def render_slide(md, base_dir):
     return f'<section class="slide"><div class="slide-inner">{head}{why}{body}</div></section>'
 
 
-def build_html(md, base_dir, title=None, subtitle=None, eyebrow="Growth recon"):
+def build_html(md, base_dir, title=None, subtitle=None, eyebrow=None, lang=None):
+    ui = UI.get(lang or detect_lang(md), UI["en"])
+    eyebrow = eyebrow or ui["eyebrow"]
     lines = md.replace("\r\n", "\n").split("\n")
 
     doc_title, sub, start = None, None, 0
@@ -896,13 +947,15 @@ def build_html(md, base_dir, title=None, subtitle=None, eyebrow="Growth recon"):
         f'<div class="eyebrow">{html_mod.escape(eyebrow)}</div>'
         f"<h1>{html_mod.escape(title)}</h1>{domain_html}"
         f'<p class="sub">{inline(subtitle, base_dir) if subtitle else ""}</p>'
-        f'<div class="note">{html_mod.escape(COVER_NOTE)}</div>'
+        f'<div class="note">{html_mod.escape(ui["note"])}</div>'
         "</div></section>")
 
-    slides = [cover] + [render_slide(part, base_dir)
+    slides = [cover] + [render_slide(part, base_dir, ui)
                         for part in split_slides("\n".join(lines))]
-    return DECK_PAGE.format(title=html_mod.escape(title), css=DECK_CSS,
-                            js=DECK_JS, slides="".join(slides))
+    return DECK_PAGE.format(title=html_mod.escape(title),
+                            css=DECK_CSS.replace("{more}", ui["more"]),
+                            js=DECK_JS, slides="".join(slides),
+                            lang=ui["lang"], hint=ui["hint"])
 
 
 def to_pdf(html_path, pdf_path, browser):
@@ -951,7 +1004,7 @@ def main():
 
     base_dir = os.path.dirname(os.path.abspath(src))
     page = build_html(md, base_dir, title=opt("--title"), subtitle=opt("--subtitle"),
-                      eyebrow=opt("--eyebrow") or "Growth recon")
+                      eyebrow=opt("--eyebrow"), lang=opt("--lang"))
 
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(page)

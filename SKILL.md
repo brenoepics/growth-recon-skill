@@ -328,6 +328,12 @@ markdown that still reads fine on its own:
 | `> one line` straight after a heading | the "why this matters" band |
 | a `::: stats` block of `value \| label` lines | number tiles that count up |
 
+**Write the report in the language of whoever will read it.** A report on a
+Brazilian company is for people who work there, so write it in Portuguese. The
+deck picks up the language from the text and translates its own furniture, and
+`--lang pt` forces it. Confidence markers work in either language, so
+`[observado]` and `[inferido]` chip the same as the English words.
+
 For a video instead of a page, same markdown:
 
 ```bash
