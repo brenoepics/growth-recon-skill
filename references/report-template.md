@@ -3,10 +3,19 @@
 Use this structure. Adapt the depth to the request — a "what's their pixel ID"
 question gets a few lines, not this whole thing.
 
-The finished report is rendered to PDF with `scripts/report_pdf.py`, so write
-plain markdown and let the renderer handle presentation. Two things it keys off:
-the `# ` title line (the template's "Growth recon: Acme (https://acme.com)" form
-becomes the cover) and the confidence markers, which become coloured chips.
+The finished report is rendered to an animated HTML deck with
+`scripts/report_deck.py`, so write plain markdown and let the renderer handle
+presentation. What it keys off:
+
+- the `# ` title line, in the form `Growth recon: Acme (https://acme.com)`,
+  which becomes the opening slide
+- `## ` headings, each of which starts a new slide
+- a `>` line straight after a heading, which becomes the "why this matters" band
+- a `::: stats` block of `value | label` lines, which becomes number tiles
+- the confidence markers, which become coloured chips
+
+The markdown is still the detailed record and is delivered alongside the deck,
+so detail that will not fit on a slide belongs in it rather than being cut.
 
 ## Write so anyone can read it
 
@@ -113,6 +122,15 @@ Only what the files actually support.
   shows the schema rather than the numbers, and what that still tells you
 
 ## Live ads
+
+<!-- A stats block renders as number tiles in the deck. Use it where a slide
+     turns on a handful of figures. -->
+
+::: stats
+6 | active ads on Meta
+3 | distinct offers
+:::
+
 
 What they are running right now, from the public ad libraries. Lead with the
 creative — it is the part a reader actually wants to see.

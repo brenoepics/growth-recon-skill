@@ -106,7 +106,7 @@ Five more scripts cover ground the collector does not. They are described under
 | `company.py` | who they are hiring, what they ship, what they file |
 | `history.py` | what their measurement looked like before |
 | `compare.py` | whether a number is normal for their market |
-| `report_pdf.py` | turns the finished report into a designed PDF |
+| `report_deck.py` | turns the finished report into an animated HTML deck |
 
 All of them are stdlib-only and fall back to `curl` when Python's CA store is
 broken, which is common. They need Python 3.9 or newer, which macOS and Linux
@@ -305,24 +305,32 @@ sentence. `references/report-template.md` has the full rule and the word swaps.
 The renderer counts em dashes, over-long sentences and long words, so run it and
 fix what it flags.
 
-**Deliver a PDF, not a markdown file.** Markdown is the working format; it is
-not what someone opens in a meeting or forwards to a client. Write the report as
-markdown, then render it:
+**Deliver two things: a deck and the markdown.** The markdown is the detailed
+record and stays exactly as written. The deck is what someone opens, reads on a
+screen, or walks a room through.
 
 ```bash
-python3 -I scripts/report_pdf.py acme-recon.md
+python3 -I scripts/report_deck.py acme-recon.md
 ```
 
-That produces a designed document with a cover page, page numbers, and the
-confidence markers set as coloured chips so a reader can see at a glance which
-sentences are evidence and which are interpretation. Images referenced in the
-report are embedded, so the PDF is a single self-contained file that survives
-being emailed. Hand over the PDF and say where the markdown is, in case they
-want to edit it.
+That writes one HTML file with the styling, the script and every image inlined.
+No build step, no server, no network. It opens on a double click and survives
+being emailed. Hand over both files and say which is which.
 
-It needs a Chrome, Chromium, Edge or Brave binary, which it finds on its own. If
-there is none it still writes the styled HTML and says so — an HTML file someone
-can open and print is a usable deliverable, so do not treat that as a failure.
+Write the markdown so it becomes a good deck. Four conventions, all plain
+markdown that still reads fine on its own:
+
+| In the markdown | In the deck |
+|---|---|
+| `## Heading` | starts a new slide |
+| `---` | also starts a new slide |
+| `> one line` straight after a heading | the "why this matters" band |
+| a `::: stats` block of `value \| label` lines | number tiles that count up |
+
+Keep a slide to one idea. A slide that needs three paragraphs is three slides,
+or it belongs only in the markdown. The explainer line under each heading is
+the part that makes the deck readable by someone who was not in the room, so
+write it for them and not for yourself.
 
 Mark every substantive claim:
 

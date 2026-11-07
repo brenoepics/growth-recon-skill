@@ -106,8 +106,16 @@ What does zendesk.com charge, and where does self-serve end?
 Compare asana.com, monday.com and clickup.com
 ```
 
-You get back a designed PDF, not a wall of code. It opens with a plain summary
-anyone can read, with the detail underneath for whoever wants it.
+You get back two things:
+
+- **An animated HTML deck.** One file, opens in any browser, no install. Arrow
+  keys to move, `O` for every slide at once. Each slide carries a line saying
+  why it matters, and the numbers count up as they appear.
+- **The detailed write-up.** The full markdown, with everything that did not fit
+  on a slide.
+
+Send the deck to a client or put it on a screen. Keep the write-up for whoever
+wants the whole thing.
 
 <br>
 
@@ -157,7 +165,7 @@ Code, run `/reload-skills` afterwards so it shows up straight away.
 | :--- | :--- | :--- |
 | Node | The one install command | Usually yes |
 | Python 3.9+ | Running the reading tools | Yes on Mac and Linux. Windows users get it from python.org |
-| Chrome or Edge | Only for making the PDF | Almost certainly yes |
+| A browser | Opening the deck, and optional PDF export | Yes |
 
 Nothing else. No account, no API key, no subscription.
 
@@ -223,7 +231,7 @@ Eight small programs in plain Python, with nothing to install:
 | `company.py` | Hiring, mobile apps, public filings |
 | `history.py` | How their setup looked in past years |
 | `compare.py` | Several companies side by side |
-| `report_pdf.py` | Turns the finished report into a PDF |
+| `report_deck.py` | Turns the finished report into an animated HTML deck |
 
 `SKILL.md` tells your assistant how to use them. `references/` holds the
 detailed notes it reads when it needs them.
@@ -254,8 +262,8 @@ python3 -I scripts/history.py GTM-XXXXXXX --diff
 # Several companies at once
 python3 -I scripts/compare.py a.com b.com c.com
 
-# Make the PDF
-python3 -I scripts/report_pdf.py report.md
+# Build the deck
+python3 -I scripts/report_deck.py report.md
 ```
 
 Add `--help` to any of them.
