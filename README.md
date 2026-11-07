@@ -113,6 +113,8 @@ You get back two things:
   why it matters, and the numbers count up as they appear.
 - **The detailed write-up.** The full markdown, with everything that did not fit
   on a slide.
+- **Optionally an MP4**, if you would rather send a video than a link. Needs
+  ffmpeg.
 
 Send the deck to a client or put it on a screen. Keep the write-up for whoever
 wants the whole thing.
@@ -264,6 +266,9 @@ python3 -I scripts/compare.py a.com b.com c.com
 
 # Build the deck
 python3 -I scripts/report_deck.py report.md
+
+# Or render it as a video
+python3 -I scripts/report_video.py report.md
 ```
 
 Add `--help` to any of them.

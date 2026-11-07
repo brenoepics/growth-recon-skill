@@ -444,11 +444,16 @@ html.js-deck,html.js-deck body{height:100%;overflow:hidden}
 .js-deck .deck{position:relative;height:100vh;width:100vw}
 .js-deck .bar,.js-deck .count,.js-deck .hint,.js-deck .nav{display:block}
 .js-deck .nav{display:flex}
+/* Centring with justify-content clips anything taller than the viewport AND
+   makes the clipped part unreachable, because flexbox does not let you scroll
+   past the start of a centred item. Auto margins on the child centre it while
+   it fits and let it scroll normally once it does not. */
 .js-deck .slide{position:absolute;inset:0;display:flex;flex-direction:column;
-       justify-content:center;border-bottom:0;
+       justify-content:flex-start;border-bottom:0;
        opacity:0;visibility:hidden;transform:translateY(14px) scale(.995);
        transition:opacity .42s var(--ease),transform .42s var(--ease),visibility 0s .42s;
-       overflow-y:auto}
+       overflow-y:auto;overscroll-behavior:contain}
+.js-deck .slide-inner{margin:auto}
 .js-deck .slide.active{opacity:1;visibility:visible;transform:none;
        transition-delay:0s,0s,0s}
 .js-deck .slide.leaving{opacity:0;transform:translateY(-10px) scale(.995)}
@@ -459,7 +464,7 @@ html.js-deck,html.js-deck body{height:100%;overflow:hidden}
    radial-gradient(1100px 620px at 12% -10%,rgba(123,63,228,.30),transparent 60%),
    radial-gradient(900px 560px at 88% 112%,rgba(43,92,230,.34),transparent 60%),
    var(--ink);
-   color:#fff;justify-content:center}
+   color:#fff}
 .slide.title .eyebrow{font-size:.78rem;letter-spacing:.22em;text-transform:uppercase;
    color:#8fb0ff;font-weight:700;margin-bottom:1.1rem}
 .slide.title h1{font-size:clamp(2.6rem,6.6vw,5rem);line-height:1.02;margin:0 0 .7rem;
@@ -559,8 +564,13 @@ figcaption{font-size:.84rem;color:var(--muted);margin-top:.5rem}
 .hint{position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%);z-index:40;
       font-size:.78rem;color:#8fb0ff;opacity:1;transition:opacity .4s}
 .hint.gone{opacity:0;pointer-events:none}
+.js-deck .slide.more.active ~ .hint{opacity:0}
 .hint kbd{background:rgba(255,255,255,.14);border-radius:5px;padding:.1em .45em;
           font-family:inherit;font-size:.9em}
+.slide.more::after{content:"more below \\2193";position:absolute;left:50%;bottom:3.2rem;
+  transform:translateX(-50%);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);background:rgba(255,255,255,.92);border:1px solid var(--rule);
+  border-radius:20px;padding:.25rem .7rem;pointer-events:none}
 .nav{position:fixed;inset:0;z-index:20;display:flex;pointer-events:none}
 .nav div{flex:1;pointer-events:auto;cursor:w-resize}
 .nav div:last-child{flex:2;cursor:e-resize}
@@ -672,8 +682,25 @@ DECK_JS = r"""
     bar.style.transform = 'scaleX(' + ((i + 1) / slides.length) + ')';
     count.textContent = (i + 1) + ' / ' + slides.length;
     Array.prototype.forEach.call(s.querySelectorAll('.stat .v'), countUp);
+    // Tell the reader when a slide continues past the fold.
+    setTimeout(function(){
+      s.classList.toggle('more', s.scrollHeight - s.clientHeight > 8);
+    }, 60);
     if (history.replaceState) history.replaceState(null, '', '#' + (i + 1));
     if (i > 0 && hint) hint.classList.add('gone');
+  }
+
+  // Returns true if the current slide still had room to scroll in that
+  // direction, meaning the key should scroll rather than change slide.
+  function scrollBy(dir){
+    var s = slides[i];
+    if (!s) return false;
+    var room = s.scrollHeight - s.clientHeight;
+    if (room < 8) return false;
+    var atEnd = dir > 0 ? (s.scrollTop >= room - 4) : (s.scrollTop <= 4);
+    if (atEnd) return false;
+    s.scrollBy({ top: dir * Math.round(s.clientHeight * 0.82), behavior: 'smooth' });
+    return true;
   }
 
   function next(){ show(i + 1); }
@@ -685,10 +712,17 @@ DECK_JS = r"""
       return;
     }
     switch (e.key) {
-      case 'ArrowRight': case 'ArrowDown': case ' ': case 'PageDown':
+      case 'ArrowDown': case ' ': case 'PageDown':
+        // On a slide taller than the window, down scrolls it first and only
+        // advances once the bottom is reached. Otherwise the end of a long
+        // slide is unreachable with the keyboard.
+        if (scrollBy(1)) { e.preventDefault(); break; }
         e.preventDefault(); next(); break;
-      case 'ArrowLeft': case 'ArrowUp': case 'PageUp':
+      case 'ArrowUp': case 'PageUp':
+        if (scrollBy(-1)) { e.preventDefault(); break; }
         e.preventDefault(); prev(); break;
+      case 'ArrowRight': e.preventDefault(); next(); break;
+      case 'ArrowLeft': e.preventDefault(); prev(); break;
       case 'Home': show(0); break;
       case 'End': show(slides.length - 1); break;
       case 'o': case 'O': case 'Escape': toggleGrid(); break;

@@ -107,6 +107,7 @@ Five more scripts cover ground the collector does not. They are described under
 | `history.py` | what their measurement looked like before |
 | `compare.py` | whether a number is normal for their market |
 | `report_deck.py` | turns the finished report into an animated HTML deck |
+| `report_video.py` | renders that deck as an MP4 |
 
 All of them are stdlib-only and fall back to `curl` when Python's CA store is
 broken, which is common. They need Python 3.9 or newer, which macOS and Linux
@@ -326,6 +327,18 @@ markdown that still reads fine on its own:
 | `---` | also starts a new slide |
 | `> one line` straight after a heading | the "why this matters" band |
 | a `::: stats` block of `value \| label` lines | number tiles that count up |
+
+For a video instead of a page, same markdown:
+
+```bash
+python3 -I scripts/report_video.py acme-recon.md            # 1920x1080
+python3 -I scripts/report_video.py acme-recon.md --vertical  # 1080x1920
+```
+
+It photographs each slide and crossfades them with ffmpeg, holding each one in
+proportion to how much there is to read. It animates between slides, not within
+them, so it suits sending a report to someone rather than making a motion
+graphic.
 
 Keep a slide to one idea. A slide that needs three paragraphs is three slides,
 or it belongs only in the markdown. The explainer line under each heading is
